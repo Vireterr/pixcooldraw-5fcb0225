@@ -21,6 +21,7 @@ type BrushKind =
   | "lightning"
   | "pixelRain"
   | "pixelGlitch"
+  | "pixelGlitch2"
   | "mosaic"
   | "embers"
   | "fill"
@@ -129,6 +130,7 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "lightning", label: "Молния" },
   { id: "pixelRain", label: "Пикс. дождь" },
   { id: "pixelGlitch", label: "Глитч" },
+  { id: "pixelGlitch2", label: "П.глитч" },
   { id: "mosaic", label: "Мозаика" },
   { id: "embers", label: "Угли" },
 ];
@@ -437,6 +439,63 @@ function paintRGB(target: PaintTarget, x: number, y: number, sizeW: number, size
     }
   }
 }
+// BUG FIX: "RGB сдвиг" used to call paintRGB three times with two channels forced to 0 each time
+// (e.g. r,0,0 then 0,g,0 then 0,0,b). paintRGB does a REAL alpha-over blend on all three channels
+// every call, so the two zeroed channels got dragged toward black by `ia` on every single one of
+// the three passes — three compounding partial-darkenings of the same pixel. At any real alpha the
+// stroke came out visibly muddy/desaturated wherever the offsets overlapped (which is most of the
+// stroke, since `off` is only a few px), which is what read as "color swallowing the brush" — the
+// brush's own texture (edge falloff, noise-driven lightness variance) survived, but the true color
+// under it got crushed toward gray by the compounded blend. Real chromatic aberration only ever
+// touches ONE channel per offset and leaves the other two exactly as they already are — this does
+// that: blends only the requested channel, leaves the other two untouched instead of blending them
+// toward 0.
+function paintChannel(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: number, channel: 0 | 1 | 2, value: number, a: number) {
+  if (a <= 0) return;
+  if (target.spray) {
+    if (Math.random() > (target.sprayKeep ?? 0.55)) return;
+    x += (Math.random() - 0.5) * target.spray;
+    y += (Math.random() - 0.5) * target.spray;
+  }
+  if (target.mode === "ctx") {
+    // ctx path has no cheap single-channel blend primitive — fall back to the old (slightly muddier)
+    // behavior there only; the live buffer path (the one actually used for on-screen drawing/lag) is
+    // what this fix targets.
+    const rgb = [0, 0, 0]; rgb[channel] = value;
+    target.ctx!.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${a})`;
+    target.ctx!.fillRect(x, y, sizeW, sizeH);
+    return;
+  }
+  const buf = target.buf!, bw = target.bw!, bh = target.bh!;
+  const x0 = Math.max(0, Math.floor(x));
+  const y0 = Math.max(0, Math.floor(y));
+  const x1 = Math.min(bw, Math.floor(x) + Math.max(1, Math.round(sizeW)));
+  const y1 = Math.min(bh, Math.floor(y) + Math.max(1, Math.round(sizeH)));
+  if (x1 <= x0 || y1 <= y0) return;
+  const alpha = Math.min(1, a);
+  const ia = 1 - alpha;
+  if (target.mode === "iso") {
+    const alphaBuf = target.alphaBuf!;
+    for (let yy = y0; yy < y1; yy++) {
+      for (let xx = x0; xx < x1; xx++) {
+        const idx = (yy * bw + xx) * 4, aIdx = yy * bw + xx;
+        const dstA = alphaBuf[aIdx] / 255;
+        const outA = alpha + dstA * (1 - alpha);
+        if (outA <= 0) continue;
+        const iaIso = dstA * (1 - alpha);
+        buf[idx + channel] = (value * alpha + buf[idx + channel] * iaIso) / outA;
+        alphaBuf[aIdx] = outA * 255;
+      }
+    }
+    return;
+  }
+  for (let yy = y0; yy < y1; yy++) {
+    let idx = (yy * bw + x0) * 4 + channel;
+    for (let xx = x0; xx < x1; xx++, idx += 4) {
+      buf[idx] = value * alpha + buf[idx] * ia;
+    }
+  }
+}
 function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: number, h: number, s: number, l: number, a: number) {
   if (a <= 0) return;
   // Generic "Распыление" scatter: random sparse skip + small positional jitter, applied at the one
@@ -497,9 +556,12 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
   // generically at the shared color-plotting call site instead of that one brush's bespoke loop.
   if (target.rgbShift) {
     const off = target.rgbShift;
-    paintRGB(target, x - off, y, sizeW, sizeH, r, 0, 0, a);
-    paintRGB(target, x, y, sizeW, sizeH, 0, g, 0, a);
-    paintRGB(target, x + off, y, sizeW, sizeH, 0, 0, b, a);
+    // BUG FIX: was paintRGB(..., r,0,0), paintRGB(..., 0,g,0), paintRGB(..., 0,0,b) — see
+    // paintChannel's comment above for why that compounded into a muddy, desaturated blob instead
+    // of clean fringing. paintChannel touches only the one channel each offset is responsible for.
+    paintChannel(target, x - off, y, sizeW, sizeH, 0, r, a);
+    paintChannel(target, x, y, sizeW, sizeH, 1, g, a);
+    paintChannel(target, x + off, y, sizeW, sizeH, 2, b, a);
     return;
   }
   if (target.mode === "ctx") {
@@ -1323,6 +1385,19 @@ function IndexInner() {
     // stroke onto its own point in the cycle — strokes drawn at different times now visibly
     // breathe/pulse out of sync with each other instead of all flashing on the same beat.
     const phaseOffset = (s.born % 6283) / 1000; // ~0..2π spread, so it covers a full cycle
+    // BUG FIX ("общий паттерн" visible under dense painting / brushes losing individuality): every
+    // brush below snaps its paint positions to Math.round(pos / grid) * grid — the SAME absolute
+    // lattice, always anchored at world (0,0), for every single stroke regardless of its own path,
+    // color, or identity. With many strokes overlapping (dense painting) their paint blocks all land
+    // on the exact same grid cells, which is what reads as one uniform repeating pattern stamped
+    // across the canvas instead of each stroke's own distinct texture. Giving each stroke a small,
+    // STABLE (derived from its own id — never changes frame to frame) fractional offset into the
+    // grid decorrelates overlapping strokes' lattices from each other, while each individual stroke
+    // still looks clean (still snapped to ITS OWN consistent grid, just not the same one its
+    // neighbors use). Every `Math.round(X / grid) * grid` call below adds gridPhaseX/Y before
+    // rounding for exactly this reason.
+    const gridPhaseX = hash(s.id * 2 + 1) * 0.5;
+    const gridPhaseY = hash(s.id * 2 + 2) * 0.5;
     const tt = t * (0.3 + s.speed * 2.4) + phaseOffset;
     // FIX: every mode's color animation (pulse brightness, "Поток" hue flow, gradient travel,
     // glitch re-roll rate) used to run off `tt` above — which bakes in the BRUSH's own "Скорость"
@@ -1617,16 +1692,16 @@ function IndexInner() {
               const t2 = rnd * sprayHalf + wob;
               const distN = Math.abs(t2 - wob) / (sprayHalf + 1);
               if (Math.random() > 0.85 - distN * 0.5) continue; // sparser out toward the edges
-              const gx = Math.round((cx + nx * t2) / grid) * grid;
-              const gy = Math.round((cy + ny * t2) / grid) * grid;
+              const gx = Math.round((cx + nx * t2) / grid + gridPhaseX) * grid;
+              const gy = Math.round((cy + ny * t2) / grid + gridPhaseY) * grid;
               const edge = 1 - distN;
               const l = 50 + edge * 25;
               paint(target, gx, gy, grid, grid, hueAt(i, f), 85, l, alphaMul * edge * (0.5 + Math.random() * 0.5) * alphaPr);
             }
           } else {
             for (let t2 = -halfP; t2 <= halfP; t2 += grid) {
-              const gx = Math.round((cx + nx * (t2 + wob)) / grid) * grid;
-              const gy = Math.round((cy + ny * (t2 + wob)) / grid) * grid;
+              const gx = Math.round((cx + nx * (t2 + wob)) / grid + gridPhaseX) * grid;
+              const gy = Math.round((cy + ny * (t2 + wob)) / grid + gridPhaseY) * grid;
               const edge = 1 - Math.abs(t2) / (halfP + 1);
               const l = 55 + edge * 25;
               paint(target, gx, gy, grid, grid, hueAt(i, f), 85, l, alphaMul * edge * alphaPr);
@@ -1653,8 +1728,8 @@ function IndexInner() {
             const f = k / num;
             const wave = Math.sin(p.t * 3 + phase + (i + f) * 0.15) * amp
                        + hash(i + f + tt) * s.noise * s.size * 0.5;
-            const gx = Math.round((p.x + dx * f + nx * wave) / grid) * grid;
-            const gy = Math.round((p.y + dy * f + ny * wave) / grid) * grid;
+            const gx = Math.round((p.x + dx * f + nx * wave) / grid + gridPhaseX) * grid;
+            const gy = Math.round((p.y + dy * f + ny * wave) / grid + gridPhaseY) * grid;
             const pr = p.pressure ?? 0.5;
             paint(target, gx, gy, grid, grid, (hueAt(i, f) + pass * 20) % 360, 100, 65, alphaMul * 0.75 * (0.6 + pr * 0.7));
           }
@@ -1682,8 +1757,8 @@ function IndexInner() {
           const num = Math.max(1, Math.floor(dlen / grid));
           for (let k = 0; k <= num; k++) {
             const f2 = k / num;
-            const gx = Math.round((ppx + ddx * f2) / grid) * grid;
-            const gy = Math.round((ppy + ddy * f2) / grid) * grid;
+            const gx = Math.round((ppx + ddx * f2) / grid + gridPhaseX) * grid;
+            const gy = Math.round((ppy + ddy * f2) / grid + gridPhaseY) * grid;
             // PERF: was 4 separate fillRect calls for the glow (one per side) + 1 core = 5 draws
             // per point. Now it's 1 bigger glow rect + 1 core = 2 draws. Same visual read at this
             // grid size, far fewer canvas calls (which is where the real cost is).
@@ -1708,7 +1783,7 @@ function IndexInner() {
         const idx = Math.floor(Math.random() * pts.length);
         const p = pts[idx];
         s.rain.push({
-          x: Math.round(p.x / grid) * grid + (Math.random() - 0.5) * s.size,
+          x: Math.round(p.x / grid + gridPhaseX) * grid + (Math.random() - 0.5) * s.size,
           y: p.y,
           vy: 0.5 + Math.random() * 2 * (0.3 + s.dynamics * 2),
           hue: s.mode === "gradient" ? gradientHueAtXY(p.x, p.y) : s.hue + (Math.random() - 0.5) * 40 + legacySpread * idx / nSeg,
@@ -1735,7 +1810,7 @@ function IndexInner() {
         const hueP = (r.hue + modeHueShift) % 360;
         for (let k = 0; k < r.len; k++) {
           const a = alphaMul * (1 - k / r.len);
-          paint(target, Math.round((r.x) / grid) * grid, Math.round((r.y - k * grid) / grid) * grid, grid, grid, hueP, 95, 55 + k * 3, a);
+          paint(target, Math.round((r.x) / grid + gridPhaseX) * grid, Math.round((r.y - k * grid) / grid + gridPhaseY) * grid, grid, grid, hueP, 95, 55 + k * 3, a);
         }
       }
     }
@@ -1749,33 +1824,28 @@ function IndexInner() {
       if (pts.length < 2) return;
       const grid = Math.max(2, Math.round(s.size / 6));
       const stepPts = Math.max(1, Math.floor(pts.length / 30));
-      // dynamics now doubles as "how much this brush follows the stroke's own direction": 0 keeps
-      // the slices in the original fixed horizontal pose (nx=0,ny=1 — same as before direction
-      // tracking existed), and increasing values blend smoothly toward fully following the local
-      // path direction. So dynamics no longer only controls radius — it's the one knob for both
-      // reach and how "aware" the glitch is of the stroke's own movement.
-      const segs = getSegCache(s, pts, grid);
+      // PERF: adapted from a lighter reference implementation. The previous version computed a
+      // per-point direction vector for every slice — getSegCache lookup, Math.hypot, a divide to
+      // normalize, then rotating a tangent/normal pair — so the glitch bars could "follow" the
+      // stroke's own path direction (the "Динамика"-as-follow feature). That's real, measurable
+      // per-point trig cost, and it's the main reason this brush ran heavier than the others.
+      // Dropping direction-follow and going back to a fixed horizontal pose (bars always stack
+      // vertically, slices always extend along X — same as ink/ribbon's simpler axis-aligned math)
+      // removes the seg-cache call, the hypot, the normalize, and the tx/ty rotation entirely, at
+      // the cost of the bars no longer tilting to match diagonal strokes — a fair trade for real
+      // perf headroom on this specific brush. "Динамика" goes back to controlling only reach/radius
+      // (its original, cheaper meaning), same as every other brush's dynamics slider.
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
         const hueG = hueAt(pi);
         const radius = s.size * (0.8 + s.dynamics * 1.5);
         const slices = 3 + Math.floor(s.density * 8);
-        const seg = segs[Math.min(pi, segs.length - 1)];
-        const followT = Math.max(0, Math.min(1, s.dynamics));
-        const nx0 = 0, ny0 = 1; // static pose: bars stack vertically, extend horizontally
-        const nx1 = seg ? seg.nx : nx0, ny1 = seg ? seg.ny : ny0;
-        let nx = nx0 * (1 - followT) + nx1 * followT;
-        let ny = ny0 * (1 - followT) + ny1 * followT;
-        const nlen = Math.hypot(nx, ny) || 1;
-        nx /= nlen; ny /= nlen;
-        const tx = ny, ty = -nx; // tangent = normal rotated 90°
         for (let i = 0; i < slices; i++) {
           const yOff = (i / slices - 0.5) * radius * 2;
           const shift = (hash(Math.floor(tt * 8) + i + p.t) * 2) * s.size * (0.3 + s.noise * 2);
           const widthLine = radius * 2 * (0.6 + Math.random() * 0.4);
-          const baseX = p.x + nx * yOff, baseY = p.y + ny * yOff;
-          const startX = baseX - tx * (widthLine / 2) + tx * shift;
-          const startY = baseY - ty * (widthLine / 2) + ty * shift;
+          const startX = p.x - widthLine / 2 + shift;
+          const y0 = Math.round((p.y + yOff) / grid + gridPhaseY) * grid;
           // Per feedback: color moved OUT of this brush entirely and into the "Глитч" MODE (see
           // target.glitchSplit in paint()/renderStroke) — this brush only shapes the slices now
           // (position/width/count/density), exactly like every other brush. The triple pass at
@@ -1790,17 +1860,22 @@ function IndexInner() {
           if (glitchOn) {
             for (let xb = 0; xb < widthLine; xb += grid) {
               if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-              const px = startX + tx * xb, py = startY + ty * xb;
-              paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+              paint(target, Math.round((startX + xb) / grid + gridPhaseX) * grid, y0, grid, grid, hueG, 100, 55, alphaMul * 0.55);
             }
           } else {
+            // BUG FIX ("глитч теряет текстуру, виден только силуэт" под любым режимом, кроме
+            // самого "Глитч"): the keep/skip coin-flip used to be rolled SEPARATELY for each of the
+            // 3 offset copies. At ~60% keep chance per copy, the odds that at LEAST ONE of the 3
+            // copies survives is ~93% — so almost every cell along the slice got painted by one
+            // copy or another, and the intentionally sparse, broken glitch texture collapsed into a
+            // near-solid block. Rolling the coin ONCE per position (shared by all 3 offset copies at
+            // that spot) keeps the sparsity ratio identical to the glitchOn branch above, while
+            // still getting the intended 3-copy-thick shape wherever a cell IS kept.
             const offs = [-grid, 0, grid];
-            for (let c2 = 0; c2 < 3; c2++) {
-              for (let xb = 0; xb < widthLine; xb += grid) {
-                if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-                const off = xb + offs[c2];
-                const px = startX + tx * off, py = startY + ty * off;
-                paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+            for (let xb = 0; xb < widthLine; xb += grid) {
+              if (Math.random() > 0.4 + s.intensity * 0.5) continue;
+              for (let c2 = 0; c2 < 3; c2++) {
+                paint(target, Math.round((startX + xb + offs[c2]) / grid + gridPhaseX) * grid, y0, grid, grid, hueG, 100, 55, alphaMul * 0.55);
               }
             }
           }
@@ -1809,6 +1884,58 @@ function IndexInner() {
     }
 
 
+
+    // Exact port of the reference implementation's "Глитч" brush, kept side-by-side with our own
+    // "Глитч" (pixelGlitch) above rather than replacing it — same geometry, same 3-way color split,
+    // same triple-offset pass, same per-copy random keep/skip. NOT run through our own bug fixes
+    // (shared coin-flip per position, gridPhaseX/Y lattice decorrelation, direction-follow removal)
+    // on purpose — this is meant to be the reference's brush byte-for-byte in behavior, not an
+    // improved hybrid. That means it inherits the reference's own quirks: the per-copy random check
+    // below can still read as more "filled-in" than sparse under non-glitch modes, and dense
+    // painting with this brush can still show the shared-lattice pattern other brushes no longer
+    // have. The one unavoidable adaptation: the reference's Stroke type carries an extra
+    // `gradientLongPath` flag (long-way-round vs short-way hue interpolation) that doesn't exist on
+    // this app's Stroke/sampleGradient — omitted here, so gradient sampling always takes the
+    // shortest hue path (this app's only supported mode) rather than being a toggle.
+    else if (s.kind === "pixelGlitch2") {
+      const grid = Math.max(2, Math.round(s.size / 6));
+      const stepPts = Math.max(1, Math.floor(pts.length / 30));
+      for (let pi = 0; pi < pts.length; pi += stepPts) {
+        const p = pts[pi];
+        const hueG = hueAt(pi);
+        const radius = s.size * (0.8 + s.dynamics * 1.5);
+        const slices = 3 + Math.floor(s.density * 8);
+        for (let i = 0; i < slices; i++) {
+          const yOff = (i / slices - 0.5) * radius * 2;
+          const shift = (hash(Math.floor(tt * 8) + i + p.t) * 2) * s.size * (0.3 + s.noise * 2);
+          const widthLine = radius * 2 * (0.6 + Math.random() * 0.4);
+          const x0 = p.x - widthLine / 2 + shift;
+          const y0 = Math.round((p.y + yOff) / grid) * grid;
+          const offs = [-grid, 0, grid];
+          let hues: number[];
+          if (s.mode === "gradient") {
+            // Sample the actual chosen palette at three nearby positions instead of a synthetic
+            // +120/+240 hue offset — otherwise the channel-split always looks like a generic RGB
+            // trio no matter which colors were picked, making the tool feel unresponsive to them.
+            const spread = 0.035;
+            const basePos = (p.x * gradCos + p.y * gradSin) / gradExtent + gradTravel;
+            hues = [
+              sampleGradient(s.gradientColors, basePos - spread),
+              sampleGradient(s.gradientColors, basePos),
+              sampleGradient(s.gradientColors, basePos + spread),
+            ];
+          } else {
+            hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
+          }
+          for (let c2 = 0; c2 < 3; c2++) {
+            for (let xb = 0; xb < widthLine; xb += grid) {
+              if (Math.random() > 0.4 + s.intensity * 0.5) continue;
+              paint(target, Math.round((x0 + xb + offs[c2]) / grid) * grid, y0, grid, grid, hues[c2], 100, 55, alphaMul * 0.55);
+            }
+          }
+        }
+      }
+    }
 
     else if (s.kind === "mosaic") {
       // Same "reveal by threshold" idea as Дизеринг, but the block size varies per sampled point
@@ -1834,7 +1961,7 @@ function IndexInner() {
         const sweepP = sweep + pointJitter;
         const sizeClass = noiseAt(pi * 131 + Math.floor(p.x) * 7 + Math.floor(p.y) * 13);
         const grid = baseGrid * (sizeClass > 0.5 ? 3 : sizeClass > 0 ? 2 : 1);
-        const cx = Math.round(p.x / grid) * grid, cy = Math.round(p.y / grid) * grid;
+        const cx = Math.round(p.x / grid + gridPhaseX) * grid, cy = Math.round(p.y / grid + gridPhaseY) * grid;
         const cellsAcross = Math.max(1, Math.ceil(radius / grid));
         for (let gy = -cellsAcross; gy <= cellsAcross; gy++) {
           for (let gx = -cellsAcross; gx <= cellsAcross; gx++) {
@@ -1887,7 +2014,7 @@ function IndexInner() {
           const hueE = s.mode === "gradient"
             ? gradientHueAtXY(ex, ey)
             : (s.hue + noiseAt(seed + 3) * 30 + modeHueShift) % 360;
-          paint(target, Math.round(ex / grid) * grid, Math.round(ey / grid) * grid, grid, grid, hueE, 85, lit, alphaMul * (0.3 + glow * 0.7));
+          paint(target, Math.round(ex / grid + gridPhaseX) * grid, Math.round(ey / grid + gridPhaseY) * grid, grid, grid, hueE, 85, lit, alphaMul * (0.3 + glow * 0.7));
         }
       }
     }
@@ -2322,6 +2449,21 @@ function IndexInner() {
     recomputeRainCount();
     pushHistory();
   };
+  // BUG FIX: selected strokes (marquee-selected via the "Выделение" tool) had no way to actually be
+  // removed — there was no delete path wired up anywhere, so a selection was permanently stuck on
+  // the canvas. Deletes the selected strokes from every layer, clears the now-stale selection state
+  // the same way newCanvas() does, and follows the same recomputeRainCount+pushHistory pattern as
+  // clearActive/removeLayer above so rain particle accounting and undo/redo stay correct.
+  const deleteSelectedStrokes = useCallback(() => {
+    if (selectedIdsRef.current.size === 0) return;
+    const ids = selectedIdsRef.current;
+    const next = layersRef.current.map(l => ({ ...l, strokes: l.strokes.filter(s => !ids.has(s.id)) }));
+    layersRef.current = next;
+    setLayers(next);
+    setSelectedIds(new Set());
+    recomputeRainCount();
+    pushHistory();
+  }, [recomputeRainCount, pushHistory]);
 
   // Import a PNG/JPG/GIF as a static picture on the active layer (drawn underneath that layer's
   // brush strokes, "contain"-fit to the canvas). Animated GIFs only show their first frame — this
@@ -2605,21 +2747,35 @@ function IndexInner() {
     }
   };
 
-  // Keyboard: Ctrl+Z / Ctrl+Shift+Z
+  // Keyboard: Ctrl+Z / Ctrl+Shift+Z / Delete-Backspace (delete current selection)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const meta = e.ctrlKey || e.metaKey;
-      if (!meta) return;
-      if (e.key.toLowerCase() === "z") {
-        e.preventDefault();
-        if (e.shiftKey) redo(); else undo();
-      } else if (e.key.toLowerCase() === "y") {
-        e.preventDefault(); redo();
+      if (meta) {
+        if (e.key.toLowerCase() === "z") {
+          e.preventDefault();
+          if (e.shiftKey) redo(); else undo();
+          return;
+        } else if (e.key.toLowerCase() === "y") {
+          e.preventDefault(); redo();
+          return;
+        }
+      }
+      // BUG FIX: Delete/Backspace deletes the current marquee selection. Guarded to text inputs/
+      // textareas/contentEditable so typing in the canvas-size fields, layer-name field, etc. still
+      // deletes characters as normal instead of eating the selection out from under an unrelated edit.
+      if ((e.key === "Delete" || e.key === "Backspace") && selectedIdsRef.current.size > 0) {
+        const el = e.target as HTMLElement | null;
+        const editable = el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+        if (!editable) {
+          e.preventDefault();
+          deleteSelectedStrokes();
+        }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [undo, redo]);
+  }, [undo, redo, deleteSelectedStrokes]);
 
   const ParamSlider = ({ label, value, set }: { label: string; value: number; set: (n: number) => void }) => (
     <label className="flex flex-col gap-1 text-[10px] uppercase tracking-widest text-white/50">
@@ -3000,7 +3156,7 @@ function IndexInner() {
           </div>
         </section>
 
-        <div className="text-center text-[9px] text-white/30">Ctrl+Z / Ctrl+Shift+Z</div>
+        <div className="text-center text-[9px] text-white/30">Ctrl+Z / Ctrl+Shift+Z · Delete — удалить выделение</div>
       </aside>
 
       {/* Canvas area — a free camera flying over a fixed-size canvas, not a scrolling page.
@@ -3101,6 +3257,29 @@ function IndexInner() {
                     title="Изменить размер"
                   />
                 ))}
+                {/* Delete control for the current selection — lives right on the selection overlay
+                    (same place as the rotate/scale handles above) instead of only being reachable
+                    via the Delete/Backspace keyboard shortcut, since a tablet has no keyboard to
+                    press it on. Sized well above the 10px transform handles (a comfortable ~28px
+                    finger-sized touch target, not a mouse-sized one) and placed off the box's NE
+                    corner, symmetric with the rotate stalk on the N side, so it's reachable without
+                    a hand covering the selection itself. stopPropagation keeps the tap from also
+                    being read as a click-through onto the canvas/selection-drag underneath it. */}
+                <div
+                  onPointerDown={(e) => { e.stopPropagation(); }}
+                  onClick={(e) => { e.stopPropagation(); deleteSelectedStrokes(); }}
+                  className="absolute touch-none flex items-center justify-center rounded-full border border-rose-300/80 bg-rose-500/90 text-white shadow-lg active:bg-rose-400"
+                  style={{ left: left + width + 6, top: top - 34, width: 28, height: 28, cursor: "pointer" }}
+                  title="Удалить выделенное"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M3 6h18" />
+                    <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                    <path d="M10 11v6" />
+                    <path d="M14 11v6" />
+                  </svg>
+                </div>
               </>
             );
           })()}
