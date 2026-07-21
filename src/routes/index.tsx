@@ -20,7 +20,6 @@ type BrushKind =
   | "ribbon"
   | "lightning"
   | "pixelRain"
-  | "pixelDither"
   | "pixelGlitch"
   | "mosaic"
   | "embers"
@@ -55,10 +54,7 @@ interface Stroke {
   rainbowBlinkSpeed: number;
   gradientSpeed: number;
   gradientScale: number;
-  // `alpha` optional per-stop, defaulting to 1 for strokes/presets saved before this field existed
-  // — lets a stop fade toward transparent (e.g. a gradient that dissolves at one end), matching
-  // the reference project's per-stop alpha.
-  gradientColors: { hue: number; weight: number; alpha?: number }[];
+  gradientColors: { hue: number; weight: number }[];
   gradientAngle: number;
   // Set once when the stroke is created from the "Анимация" toggle's state at that moment — frozen
   // strokes render with time locked to their birth instant, so they paint once and never animate
@@ -132,7 +128,6 @@ const BRUSHES: { id: BrushKind; label: string }[] = [
   { id: "ribbon", label: "Лента" },
   { id: "lightning", label: "Молния" },
   { id: "pixelRain", label: "Пикс. дождь" },
-  { id: "pixelDither", label: "Дизеринг" },
   { id: "pixelGlitch", label: "Глитч" },
   { id: "mosaic", label: "Мозаика" },
   { id: "embers", label: "Угли" },
@@ -274,66 +269,6 @@ function sampleGradient(stops: { hue: number; weight: number }[], t: number): nu
   return (c0 + diff * frac + 360) % 360;
 }
 
-// Reference-project-style gradient color: unlike sampleGradient above (hue only, shortest
-// angular path — good for the live hue-only ramp used elsewhere), this blends the STOPS' full
-// color in RGB space, exactly like a canvas createLinearGradient does between color stops — which
-// is what the reference project's gradient actually looked like (it rendered into an offscreen
-// canvas and used a real linear gradient). Rebuilt here as plain math instead of an offscreen
-// canvas + composite, since most of our paint targets are raw pixel buffers, not a 2D context.
-// `fallbackS`/`fallbackL` cover stops saved before per-stop saturation/lightness existed (there
-// still isn't a UI control for those — every stop currently shares the stroke's own Насыщенность/
-// Светлота — so this parameter exists for forward-compatibility if that's ever added, not because
-// stops carry it yet). Alpha per stop DOES already have a UI control, defaulting to 1.
-// Needed so the gradient ramp can hand back (hue, sat) derived from a REAL RGB blend between
-// stops — reproducing the reference project's muddy/authentic canvas-gradient transitions — while
-// still leaving each brush's own lightness (where dither/mosaic/embers etc. actually keep their
-// per-pixel grain/texture) completely untouched. See the gradientSet ramp-building block and the
-// target.gradR branch in paint().
-function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
-  r /= 255; g /= 255; b /= 255;
-  const max = Math.max(r, g, b), min = Math.min(r, g, b);
-  const l = (max + min) / 2;
-  if (max === min) return [0, 0, l * 100];
-  const d = max - min;
-  const sat = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-  let h: number;
-  if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
-  else if (max === g) h = (b - r) / d + 2;
-  else h = (r - g) / d + 4;
-  return [h * 60, sat * 100, l * 100];
-}
-
-function sampleGradientRGB(
-  stops: { hue: number; weight: number; alpha?: number }[],
-  t: number, fallbackS: number, fallbackL: number,
-): [number, number, number, number] {
-  const n = stops.length;
-  if (n === 0) return [255, 255, 255, 1];
-  const totalW = stops.reduce((a, s) => a + Math.max(0.05, s.weight), 0);
-  const norm = ((t % 1) + 1) % 1;
-  if (n === 1) { const [r, g, b] = hslToRgb(stops[0].hue, fallbackS, fallbackL); return [r, g, b, stops[0].alpha ?? 1]; }
-  let acc = 0;
-  let idx = n - 1;
-  let segStart = 0, segEnd = 1;
-  for (let i = 0; i < n; i++) {
-    const w = Math.max(0.05, stops[i].weight) / totalW;
-    const next = acc + w;
-    if (norm < next || i === n - 1) { idx = i; segStart = acc; segEnd = next; break; }
-    acc = next;
-  }
-  const frac = segEnd > segStart ? (norm - segStart) / (segEnd - segStart) : 0;
-  const s0 = stops[idx], s1 = stops[(idx + 1) % n];
-  const [r0, g0, b0] = hslToRgb(s0.hue, fallbackS, fallbackL);
-  const [r1, g1, b1] = hslToRgb(s1.hue, fallbackS, fallbackL);
-  const a0 = s0.alpha ?? 1, a1 = s1.alpha ?? 1;
-  return [
-    r0 + (r1 - r0) * frac,
-    g0 + (g1 - g0) * frac,
-    b0 + (b1 - b0) * frac,
-    a0 + (a1 - a0) * frac,
-  ];
-}
-
 // ==== PERF: pixel-buffer painting (replaces per-pixel ctx.fillStyle/fillRect calls) ====
 // Every brush used to do `ctx.fillStyle = \`hsla(...)\`; ctx.fillRect(x,y,w,h);` per pixel-block —
 // building and parsing a color string on the canvas API is real, measurable overhead at thousands
@@ -396,17 +331,6 @@ interface PaintTarget {
   // 0..1 — how much the "Хром" sheen's hue rotates as it sweeps (see paint()'s chrome branch).
   // Driven by the stroke's own "Шум" slider; 0 = plain single-hue metal.
   chromeColorAmt?: number;
-  // Hue+saturation gradient ramp for "Градиент" mode (lightness is deliberately left to the
-  // calling brush — see paint()'s target.gradR branch) — see the gradientSet block in renderStroke
-  // for how these are built (once per stroke per frame). gradR being unset means the mode is off.
-  gradR?: Float32Array;
-  gradG?: Float32Array;
-  gradA?: Float32Array;
-  gradCos?: number;
-  gradSin?: number;
-  gradExtent?: number;
-  gradScale?: number;
-  gradTravel?: number;
 }
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   h = ((h % 360) + 360) % 360;
@@ -523,21 +447,6 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
     x += (Math.random() - 0.5) * target.spray;
     y += (Math.random() - 0.5) * target.spray;
   }
-  // Generic "Градиент" mode: real per-stop hue+saturation (derived from an RGB blend between
-  // stops — the reference project's actual canvas-gradient look, including its authentic "muddy"
-  // transitions between distant hues), looked up from the ramp built once per stroke per frame
-  // (see the gradientSet block in renderStroke). Deliberately does NOT touch lightness — `l` stays
-  // whatever the calling brush computed for this exact pixel, since that's where several brushes'
-  // own per-pixel grain/texture actually lives (see the ramp-building comment for why an earlier
-  // version that also overrode lightness made textured brushes look flat).
-  if (target.gradR) {
-    const proj = ((x * (target.gradCos ?? 1) + y * (target.gradSin ?? 0)) / (target.gradExtent ?? 1)) * (target.gradScale ?? 1) + (target.gradTravel ?? 0);
-    const norm = ((proj % 1) + 1) % 1;
-    const idx = Math.min(target.gradR.length - 1, Math.floor(norm * target.gradR.length));
-    const [gr, gg, gb] = getHslRgb(target.gradR[idx], target.gradG![idx], l);
-    paintRGB(target, x, y, sizeW, sizeH, gr, gg, gb, a * target.gradA![idx]);
-    return;
-  }
   // Generic "Хром" mode: recolor toward a metallic sheen BEFORE the real color is computed —
   // unlike spray/glitchSplit/rgbShift above, this doesn't fork into multiple paint calls, it just
   // reshapes h/s/l for the one call about to happen. `band` is a plain sine of a spatial
@@ -571,23 +480,13 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
   // hue, each copy offset a few pixels apart along x — a spatial misalignment (like a badly
   // registered color print), not a color that cycles over time. This is exactly what the
   // pixelGlitch brush used to do only for itself; living here means every brush gets it.
-  // FIX: forcing SAT=90 (matching the reference project, instead of passing through whatever the
-  // active brush's own `s` happens to be) plus a much higher alpha (0.85, not 0.55) — three
-  // overlapping semi-transparent copies of hues ~120° apart AVERAGE toward grey the more
-  // transparent they are (that's just color mixing: red+green+blue-ish layers blended at low
-  // alpha wash toward neutral), which is exactly what read as "dull and pale". At high alpha, each
-  // later copy mostly REPLACES the one under it instead of blending with it, so the bulk of the
-  // shape stays one vivid, solid color and only the small offset at the edges shows the other two
-  // hues as a thin misregistered fringe — the actual "glitch print" look, not a wash.
   if (target.glitchSplit) {
     const off = target.glitchSplit;
-    const [r0, g0, b0] = getHslRgb(h, 90, 55);
-    const [r1, g1, b1] = getHslRgb((h + 120) % 360, 90, 55);
-    const [r2, g2, b2] = getHslRgb((h + 240) % 360, 90, 55);
-    const aG = a * 0.85;
-    paintRGB(target, x - off, y, sizeW, sizeH, r0, g0, b0, aG);
-    paintRGB(target, x, y, sizeW, sizeH, r1, g1, b1, aG);
-    paintRGB(target, x + off, y, sizeW, sizeH, r2, g2, b2, aG);
+    const [r1, g1, b1] = getHslRgb((h + 120) % 360, s, l);
+    const [r2, g2, b2] = getHslRgb((h + 240) % 360, s, l);
+    paintRGB(target, x - off, y, sizeW, sizeH, r, g, b, a);
+    paintRGB(target, x, y, sizeW, sizeH, r1, g1, b1, a);
+    paintRGB(target, x + off, y, sizeW, sizeH, r2, g2, b2, a);
     return;
   }
   // Generic "RGB сдвиг" mode: instead of one flat-colored blit, split the real color into its r/g/b
@@ -715,77 +614,15 @@ function pixelAt(buf: Uint8ClampedArray, w: number, x: number, y: number): [numb
   const idx = (y * w + x) * 4;
   return [buf[idx], buf[idx + 1], buf[idx + 2]];
 }
-// Literal port of the reference project's own flood-fill scan (not a rewrite/optimization of it) —
-// added as a separate, switchable algorithm per direct request, so its behavior can be compared
-// against computeFloodMask above on the exact same canvas. Structurally similar (both are
-// scanline-style flood fills) but bookkept differently: this tracks per-COLUMN up/down "already
-// queued" flags as it walks a row, where computeFloodMask above tracks a whole matched SPAN's
-// up/down rows at once — different enough in mechanics that a bug specific to one approach's
-// bookkeeping wouldn't necessarily appear in the other. Distance metric also includes alpha (the
-// reference project's own `da*da` term), included here for fidelity to the original even though
-// our buffer's alpha is always 255 (so that term is always 0 in practice).
-function computeFloodMaskLegacy(
-  buf: Uint8ClampedArray, w: number, h: number, sx: number, sy: number,
-  tolerance: number, contiguous: boolean
-): Uint8Array {
-  const visited = new Uint8Array(w * h);
-  const idx0 = (sy * w + sx) * 4;
-  const tr = buf[idx0], tg = buf[idx0 + 1], tb = buf[idx0 + 2], ta = buf[idx0 + 3];
-  const tol2 = tolerance * tolerance * 4;
-  const match = (i: number) => {
-    const dr = buf[i] - tr, dg = buf[i + 1] - tg, db = buf[i + 2] - tb, da = buf[i + 3] - ta;
-    return dr * dr + dg * dg + db * db + da * da <= tol2;
-  };
-  if (!contiguous) {
-    for (let y = 0, p = 0; y < h; y++) for (let x = 0; x < w; x++, p++) if (match(p * 4)) visited[p] = 1;
-    return visited;
-  }
-  const stack: number[] = [sx, sy];
-  while (stack.length) {
-    const y = stack.pop()!;
-    let x = stack.pop()!;
-    let i = (y * w + x) * 4;
-    while (x >= 0 && !visited[y * w + x] && match(i)) { x--; i -= 4; }
-    x++; i += 4;
-    let up = false, down = false;
-    while (x < w && !visited[y * w + x] && match(i)) {
-      visited[y * w + x] = 1;
-      if (y > 0) {
-        const ui = ((y - 1) * w + x) * 4;
-        const uok = !visited[(y - 1) * w + x] && match(ui);
-        if (uok && !up) { stack.push(x, y - 1); up = true; }
-        else if (!uok) up = false;
-      }
-      if (y < h - 1) {
-        const di = ((y + 1) * w + x) * 4;
-        const dok = !visited[(y + 1) * w + x] && match(di);
-        if (dok && !down) { stack.push(x, y + 1); down = true; }
-        else if (!dok) down = false;
-      }
-      x++; i += 4;
-    }
-  }
-  return visited;
-}
 function computeFloodMask(
   buf: Uint8ClampedArray, w: number, h: number, sx: number, sy: number,
   tolerance: number, contiguous: boolean
 ): Uint8Array {
   const mask = new Uint8Array(w * h);
   const [tr, tg, tb] = pixelAt(buf, w, sx, sy);
-  // REWORKED (per reference project): real Euclidean color distance instead of taking the max of
-  // the three channel differences. With max(), one channel being far off was enough to reject a
-  // pixel outright even if the other two channels matched closely — e.g. an anti-aliased edge
-  // pixel that's mostly the fill color but nudged in blue would fail purely on that one channel.
-  // Euclidean combines all three into one overall "how different is this color, really" measure,
-  // which is what "Допуск" actually reads as intuitively — a single combined similarity budget,
-  // not three independent per-channel gates. tolerance²×3 keeps the same per-channel scale as
-  // before (a tolerance of T still exactly passes a pixel that's off by T in only one channel).
-  const tol2 = tolerance * tolerance * 3;
   const matches = (x: number, y: number) => {
     const idx = (y * w + x) * 4;
-    const dr = buf[idx] - tr, dg = buf[idx + 1] - tg, db = buf[idx + 2] - tb;
-    return dr * dr + dg * dg + db * db <= tol2;
+    return Math.max(Math.abs(buf[idx] - tr), Math.abs(buf[idx + 1] - tg), Math.abs(buf[idx + 2] - tb)) <= tolerance;
   };
   if (!contiguous) {
     for (let i = 0, y = 0; y < h; y++) for (let x = 0; x < w; x++, i++) if (matches(x, y)) mask[i] = 1;
@@ -853,35 +690,6 @@ function strokeAutoAngleDeg(pts: StrokePoint[]): number {
   const dx = p1.x - p0.x, dy = p1.y - p0.y;
   if (Math.hypot(dx, dy) < 1) return 0;
   return ((Math.atan2(dy, dx) * 180) / Math.PI + 360) % 360;
-}
-
-// Standard 4×4 ordered (Bayer) dither matrix — 16 fixed threshold ranks, purely spatial (a lookup
-// on a cell's own grid position, nothing else). Used by the pixelDither brush.
-const BAYER_4X4 = [
-  [0, 8, 2, 10],
-  [12, 4, 14, 6],
-  [3, 11, 1, 9],
-  [15, 7, 13, 5],
-];
-
-// PERF: cached pixelDither offset patterns — the set of grid cells within `radius` of a sampled
-// point only depends on (grid, radius), which are fixed for the whole stroke, so build it once per
-// (grid, radius) pair and reuse across every sampled point/frame instead of a nested dx/dy loop +
-// Math.hypot per point per frame.
-const ditherOffsetCache = new Map<string, { dx: number; dy: number; dist: number }[]>();
-function getDitherOffsets(grid: number, radius: number) {
-  const key = `${grid}_${Math.round(radius)}`;
-  let cached = ditherOffsetCache.get(key);
-  if (cached) return cached;
-  const list: { dx: number; dy: number; dist: number }[] = [];
-  for (let dx = -radius; dx <= radius; dx += grid) {
-    for (let dy = -radius; dy <= radius; dy += grid) {
-      if (dx * dx + dy * dy > radius * radius) continue;
-      list.push({ dx, dy, dist: Math.hypot(dx, dy) / radius });
-    }
-  }
-  ditherOffsetCache.set(key, list);
-  return list;
 }
 
 let strokeIdCounter = 0;
@@ -1124,7 +932,7 @@ function IndexInner() {
   // the same cycle more times (a tighter, more compressed band pattern), lower values stretch a
   // single cycle out past the visible area.
   const [gradientScale, setGradientScale] = useState(1);
-  const [gradientColors, setGradientColors] = useState<{ hue: number; weight: number; alpha?: number }[]>([
+  const [gradientColors, setGradientColors] = useState<{ hue: number; weight: number }[]>([
     { hue: 200, weight: 1 }, { hue: 320, weight: 1 }, { hue: 60, weight: 1 },
   ]);
   const [gradientAngle, setGradientAngle] = useState(0);
@@ -1534,20 +1342,7 @@ function IndexInner() {
     const modeHueShift = s.mode === "rainbow" ? (lifeMs * (s.rainbowFlow ? 0.05 : s.rainbowBlinkSpeed * 0.1)) % 360 : 0;
     const modePulse = s.mode === "pulse" ? 0.6 + 0.5 * Math.sin(mt * (0.5 + ms * 3)) : 1;
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
-    // FIX: "Зеркало" mode pushes a SECOND point (x reflected across canvas width) into this same
-    // array right after every real one (see addPoint) — so consecutive array entries for a mirror
-    // stroke are [real0, mirror0, real1, mirror1, ...]. Every brush below connects consecutive
-    // points with a line/segment (ink, ribbon, lightning, mosaic's tiling, etc.) — which means EVERY
-    // real point got a phantom connecting line drawn straight across the canvas to its own mirrored
-    // reflection (and back), since a point near one edge mirrors to the opposite edge. That's what
-    // was showing up as random full-width horizontal bars cutting across otherwise normal drawings —
-    // not a canvas/texture issue at all, just this interleaving reaching every brush's point-pair
-    // logic. Stripping the mirrored points out here (keeping only the real, evenly-indexed ones)
-    // means every brush now only ever sees the actual drawn path — no more phantom connectors.
-    // This does mean the mirrored copy itself doesn't currently render as its own shape; restoring
-    // that as a real, separate feature (rendering the same path a second time with x flipped,
-    // instead of interleaving points) is a follow-up, not bundled into this fix.
-    const pts = s.mode === "mirror" ? s.points.filter((_, idx) => idx % 2 === 0) : s.points;
+    const pts = s.points;
     // "Радуга: Поток" keeps its original simple full-spectrum sweep, unchanged.
     // "Градиент" is now fully independent and spatial. Its base direction is auto-derived from
     // the way the brush was actually moved (start point -> end point of the stroke) — draw
@@ -1585,37 +1380,6 @@ function IndexInner() {
       const proj = ((x * gradCos + y * gradSin) / gradExtent) * s.gradientScale;
       return gradHueRampAt(proj + gradTravel);
     };
-    // Full-color (RGB+alpha, not just hue) gradient, generic at the paint()-call level — same
-    // pattern as chrome/glitch/rgbShift above, and reusing the exact same "build a small ramp once
-    // per stroke per frame" trick as gradHueRamp just above, just carrying real color instead of a
-    // single hue channel. This is the piece that actually reproduces the reference project's look
-    // (real per-stop color blended in RGB space, not just a hue-only shortest-angular-path blend)
-    // — gradHueRamp above stays untouched/still used by a few brushes for their OWN hue pick, but
-    // whatever hue those brushes compute gets overridden the instant paint() sees this ramp is set
-    // (see the target.gradR branch there), so there's no double-application, just some now-unused
-    // hue math left harmlessly in place.
-    // FIX: only hue+saturation come from the ramp (derived by converting the RGB-blended stop back
-    // to HSL) — lightness is deliberately NOT stored here / NOT overridden in paint(). Several
-    // brushes' actual "grain"/texture (dither's, mosaic's, embers' sparkle) is carried entirely by
-    // per-pixel lightness variation, not alpha — a full RGB (h+s+l all replaced) override flattened
-    // every pixel at the same position to the exact same brightness, which is what erased that
-    // texture. Keeping the brush's own `l` untouched preserves it while hue/sat still follow the
-    // gradient.
-    const gradientSet = s.mode === "gradient";
-    if (gradientSet) {
-      const gradR = new Float32Array(GRAD_RAMP_N), gradG = new Float32Array(GRAD_RAMP_N);
-      const gradA = new Float32Array(GRAD_RAMP_N);
-      for (let k = 0; k < GRAD_RAMP_N; k++) {
-        // No per-stroke saturation/lightness field exists to fall back to (each brush hardcodes
-        // its own, e.g. 85/55) — 85/60 matches the typical values already used across brushes.
-        const [r, g, bch, av] = sampleGradientRGB(s.gradientColors, k / GRAD_RAMP_N, 85, 60);
-        const [hh, ss] = rgbToHsl(r, g, bch);
-        gradR[k] = hh; gradG[k] = ss; gradA[k] = av;
-      }
-      target.gradR = gradR; target.gradG = gradG; target.gradA = gradA;
-      target.gradCos = gradCos; target.gradSin = gradSin; target.gradExtent = gradExtent;
-      target.gradScale = s.gradientScale; target.gradTravel = gradTravel;
-    }
     // "Глитч" mode: moved here from the brush per feedback — this used to be baked into the
     // pixelGlitch BRUSH's own coloring (three offset copies of the same paint() call, tinted
     // 0°/+120°/+240°, drawn a few pixels apart). That's exactly why it read as a real misaligned
@@ -1639,10 +1403,8 @@ function IndexInner() {
 
     if (s.kind === "fill") {
       const bw = w, bh = h;
-      // Canvas was resized since this fill was made — the mask no longer lines up with pixel
-      // positions, so skip rather than smear stale data across a differently-sized canvas.
       if (s.fillW !== bw || s.fillH !== bh) return;
-      if (!s.fillMaskCache) {
+      if (!s.fillMaskCache || s.fillMaskCache.length !== bw * bh) {
         s.fillMaskCache = decodeMaskRLE(s.fillRuns!, bw * bh);
         let bx0 = bw, by0 = bh, bx1 = -1, by1 = -1;
         const m = s.fillMaskCache;
@@ -1659,12 +1421,12 @@ function IndexInner() {
       }
       const mask = s.fillMaskCache;
       const { x0: bx0, y0: by0, x1: bx1, y1: by1 } = s.fillBBox!;
-      const alpha = Math.min(1, 0.3 + s.intensity * 0.8) * modePulse;
+      if (bx1 <= bx0 || by1 <= by0) return;
+
+      // Fill всегда полностью непрозрачный — перекрывает всё под ним
+      const alpha = 1.0;
 
       if (s.mode === "gradient") {
-        // Precompute a coarse hue ramp along the gradient's projection axis ONCE per frame instead
-        // of calling sampleGradient()+hslToRgb() per pixel — a fill can cover hundreds of thousands
-        // of pixels, so per-pixel trig/interpolation every frame would be far too slow.
         const RAMP = 96;
         const ramp: [number, number, number][] = new Array(RAMP);
         for (let k = 0; k < RAMP; k++) {
@@ -1673,29 +1435,25 @@ function IndexInner() {
         }
         if (target.mode === "buffer") {
           const buf = target.buf!;
-          const ia = 1 - alpha;
           for (let yy = by0; yy < by1; yy++) {
-            let mi = yy * bw + bx0;
-            for (let xx = bx0; xx < bx1; xx++, mi++) {
+            for (let xx = bx0; xx < bx1; xx++) {
+              const mi = yy * bw + xx;
               if (!mask[mi]) continue;
               const proj = ((xx * gradCos + yy * gradSin) / gradExtent) * s.gradientScale + gradTravel;
               const norm = ((proj % 1) + 1) % 1;
               const [r, g, b] = ramp[Math.min(RAMP - 1, Math.floor(norm * RAMP))];
               const idx = mi * 4;
-              buf[idx] = r * alpha + buf[idx] * ia;
-              buf[idx + 1] = g * alpha + buf[idx + 1] * ia;
-              buf[idx + 2] = b * alpha + buf[idx + 2] * ia;
+              buf[idx] = r;
+              buf[idx + 1] = g;
+              buf[idx + 2] = b;
               buf[idx + 3] = 255;
             }
           }
         } else if (target.mode === "iso") {
-          // Bake path — runs once per frozen fill instead of every frame, so real per-pixel alpha
-          // compositing (needed to seed the isolated buffer correctly) is affordable here even
-          // though the "buffer" fast path above skips it as unnecessary overhead for live redraw.
           const buf = target.buf!, alphaBuf = target.alphaBuf!;
           for (let yy = by0; yy < by1; yy++) {
-            let mi = yy * bw + bx0;
-            for (let xx = bx0; xx < bx1; xx++, mi++) {
+            for (let xx = bx0; xx < bx1; xx++) {
+              const mi = yy * bw + xx;
               if (!mask[mi]) continue;
               const proj = ((xx * gradCos + yy * gradSin) / gradExtent) * s.gradientScale + gradTravel;
               const norm = ((proj % 1) + 1) % 1;
@@ -1704,8 +1462,6 @@ function IndexInner() {
             }
           }
         } else {
-          // Export path — runs far less often than live playback, fine to go through the shared
-          // paint() helper at full per-pixel precision.
           for (let yy = by0; yy < by1; yy++) {
             for (let xx = bx0; xx < bx1; xx++) {
               if (!mask[yy * bw + xx]) continue;
@@ -1714,21 +1470,18 @@ function IndexInner() {
           }
         }
       } else {
-        // normal / rainbow / pulse: one solid (possibly time-shifting) color for the whole fill —
-        // same "wash" behavior these modes always had for Заливка, just restricted to the mask.
         const hueF = hueAt(0, 0);
         if (target.mode === "buffer") {
           const [r, g, b] = getHslRgb(hueF, 85, 55);
           const buf = target.buf!;
-          const ia = 1 - alpha;
           for (let yy = by0; yy < by1; yy++) {
-            let mi = yy * bw + bx0;
-            for (let xx = bx0; xx < bx1; xx++, mi++) {
+            for (let xx = bx0; xx < bx1; xx++) {
+              const mi = yy * bw + xx;
               if (!mask[mi]) continue;
               const idx = mi * 4;
-              buf[idx] = r * alpha + buf[idx] * ia;
-              buf[idx + 1] = g * alpha + buf[idx + 1] * ia;
-              buf[idx + 2] = b * alpha + buf[idx + 2] * ia;
+              buf[idx] = r;
+              buf[idx + 1] = g;
+              buf[idx + 2] = b;
               buf[idx + 3] = 255;
             }
           }
@@ -1736,8 +1489,8 @@ function IndexInner() {
           const [r, g, b] = getHslRgb(hueF, 85, 55);
           const buf = target.buf!, alphaBuf = target.alphaBuf!;
           for (let yy = by0; yy < by1; yy++) {
-            let mi = yy * bw + bx0;
-            for (let xx = bx0; xx < bx1; xx++, mi++) {
+            for (let xx = bx0; xx < bx1; xx++) {
+              const mi = yy * bw + xx;
               if (!mask[mi]) continue;
               blendIsoPixel(buf, alphaBuf, mi * 4, mi, r, g, b, alpha);
             }
@@ -1785,7 +1538,7 @@ function IndexInner() {
     const glitchSplitSet = glitchOn;
     if (glitchSplitSet) {
       const jitter = 0.6 + 0.4 * Math.sin(mt * (2 + ms * 10) + phaseOffset);
-      target.glitchSplit = 3 * jitter;
+      target.glitchSplit = 1.5 * jitter;
     }
     // "Хром" mode — generic metallic sheen, works with ANY brush the same way rgbShift/glitch do.
     // Sweep direction follows the stroke's own drawn direction (same strokeAutoAngleDeg already
@@ -1987,48 +1740,6 @@ function IndexInner() {
       }
     }
 
-    else if (s.kind === "pixelDither") {
-      // REBUILT with a real 4×4 ordered (Bayer) dither matrix — 16 brightness/coverage levels
-      // instead of the earlier 2×2 rewrite's 4. The on/off decision for a cell is a lookup on
-      // BAYER_4X4 compared against `litRanks` (from the density slider) — always exactly `litRanks`
-      // out of 16 possible ranks are lit, every single frame, no matter what. That count never
-      // changes, so the total painted coverage/shape can never collapse toward black the way the
-      // old sweep+bayer+noise SUM threshold could.
-      // LIVING AGAIN: `shift` scrolls which physical cells map to which rank, diagonally, over
-      // time (a classic "marching dither" look) — it changes WHERE the 16 ranks land, never HOW
-      // MANY are lit, so the shape/coverage stays exactly as stable as a fully static version while
-      // the texture itself visibly crawls. Purely an index rotation (mod 4), not a sum of terms
-      // that could ever add up to "nothing clears the threshold" — structurally as safe as no
-      // animation at all.
-      const grid = Math.max(4, Math.round(s.size / 4));
-      const stepPts = Math.max(1, Math.floor(pts.length / 40));
-      const radius = s.size * (1 + s.dynamics * 1.5);
-      const offsets = getDitherOffsets(grid, radius);
-      // density picks how many of the 16 Bayer ranks are lit: density=0 still lights rank 0 (a
-      // real, visible sparse 1-in-16 texture, never zero coverage), density=1 lights all 16 (solid).
-      const litRanks = Math.max(1, Math.round(1 + s.density * 15));
-      const shift = Math.floor(tt * (1.5 + s.speed * 6));
-      for (let pi = 0; pi < pts.length; pi += stepPts) {
-        const p = pts[pi];
-        const hueD = hueAt(pi);
-        const cx = Math.round(p.x / grid) * grid;
-        const cy = Math.round(p.y / grid) * grid;
-        for (const off of offsets) {
-          const gx = cx + off.dx, gy = cy + off.dy;
-          const dist = off.dist; // 0 (center) .. 1 (brush edge) — fixed per offset, never animated
-          const bx = (((gx / grid + shift) % 4) + 4) % 4;
-          const by = (((gy / grid + shift) % 4) + 4) % 4;
-          const rank = BAYER_4X4[bx][by];
-          if (rank >= litRanks) continue;
-          const edgeFade = 1 - dist; // static round brush-edge falloff
-          if (edgeFade <= 0) continue;
-          const grain = noiseAt(gx + gy * 7); // purely spatial — no time term, can't flicker
-          const lit = 46 + grain * 16;
-          paint(target, gx, gy, grid, grid, hueD + (rank % 2 ? 20 : 0), 85, lit, alphaMul * edgeFade);
-        }
-      }
-    }
-
     else if (s.kind === "pixelGlitch") {
       // With just one point (right after pointer-down, before any movement), the full slice
       // pattern was still drawn stacked around that single spot — there's no real direction yet,
@@ -2173,16 +1884,9 @@ function IndexInner() {
           const phase = ((noiseAt(seed + 2) + 1) / 2) * Math.PI * 2;
           const glow = 0.5 + 0.5 * Math.sin((tt * 2 * Math.PI) / period + phase);
           const lit = 20 + glow * (30 + s.intensity * 20);
-          // FIX: this used to compute hue by hand (s.hue + jitter + modeHueShift, with its own
-          // one-off special case for gradient mode) instead of going through the shared hueAt() —
-          // the same function ink/ribbon/mosaic/dither all call. That bypass is exactly why
-          // "Радуга: Поток вдоль мазка" didn't work here: hueAt() is what actually varies hue by
-          // position along the stroke (legacySpread*posT) for that mode; embers' own formula only
-          // ever added a flat modeHueShift, the same for every coal regardless of where it sat on
-          // the path. hueAt(pi) now supplies the real per-position hue (rainbow flow, gradient, or
-          // plain — whichever mode is active), with the same per-coal random jitter layered on top
-          // as before so individual coals still look scattered rather than perfectly uniform.
-          const hueE = hueAt(pi) + noiseAt(seed + 3) * 30;
+          const hueE = s.mode === "gradient"
+            ? gradientHueAtXY(ex, ey)
+            : (s.hue + noiseAt(seed + 3) * 30 + modeHueShift) % 360;
           paint(target, Math.round(ex / grid) * grid, Math.round(ey / grid) * grid, grid, grid, hueE, 85, lit, alphaMul * (0.3 + glow * 0.7));
         }
       }
@@ -2193,7 +1897,6 @@ function IndexInner() {
       if (rgbShiftSet) { target.rgbShift = undefined; }
       if (glitchSplitSet) { target.glitchSplit = undefined; }
       if (chromeSet) { target.chromeFreq = undefined; target.chromeCos = undefined; target.chromeSin = undefined; target.chromePhase = undefined; target.chromeColorAmt = undefined; }
-      if (gradientSet) { target.gradR = undefined; target.gradG = undefined; target.gradA = undefined; target.gradCos = undefined; target.gradSin = undefined; target.gradExtent = undefined; target.gradScale = undefined; target.gradTravel = undefined; }
     }
   }
 
@@ -2292,10 +1995,7 @@ function IndexInner() {
   }
 
   // === Pointer ===
-  // Shared by getPoint below AND the coalesced-event handling in onMove — same canvas-space
-  // conversion + pressure fallback, usable for any {clientX, clientY, pressure} triple, not just
-  // the one PointerEvent React handed us.
-  const toCanvasPoint = (clientX: number, clientY: number, pressureRaw: number) => {
+  const getPoint = (e: React.PointerEvent) => {
     const c = canvasRef.current!;
     const r = c.getBoundingClientRect();
     const sx = canvasSize.w / r.width;
@@ -2303,10 +2003,9 @@ function IndexInner() {
     // Pointer Events report 0.5 for mouse/generic pointers while a button is held (and 0 for touch
     // on some browsers that don't report real pressure) — 0.5 is the sane "no real pressure data"
     // fallback so those devices draw at a normal, constant weight instead of at zero/invisible.
-    const pressure = pressureRaw > 0 ? pressureRaw : 0.5;
-    return { x: (clientX - r.left) * sx, y: (clientY - r.top) * sy, pressure };
+    const pressure = e.pressure > 0 ? e.pressure : 0.5;
+    return { x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy, pressure };
   };
-  const getPoint = (e: React.PointerEvent) => toCanvasPoint(e.clientX, e.clientY, e.pressure);
 
   const addPoint = (x: number, y: number, pressure = 0.5) => {
     const s = currentStrokeRef.current;
@@ -2383,58 +2082,57 @@ function IndexInner() {
     }
 
     if (refs.brush.current === "fill") {
-      // Bucket fill is a single click, not a draggable stroke — it reads whatever is actually
-      // composited on screen right now (not brush history) and commits its result immediately.
       pointerRef.current.down = false;
       const layerF = layersRef.current.find(l => l.id === activeLayerIdRef.current);
       if (!layerF || !layerF.visible) return;
-      const bufObj = pixelBufRef.current;
-      if (!bufObj) return;
+
       const w = canvasSize.w, h = canvasSize.h;
       const sx = Math.min(w - 1, Math.max(0, Math.round(x)));
       const sy = Math.min(h - 1, Math.max(0, Math.round(y)));
-      // FIX (per reference project): tolerance used to compare against the FULL multi-layer
-      // composite (bufObj.data) — every other visible layer's own content, plus the background,
-      // all bled into the same color comparison as the layer you're actually filling. Any other
-      // layer's animated texture (dither grain, rainbow flicker, chrome bands, etc.) showing
-      // through nearby could jag the tolerance boundary into a "cut stripes" look that had nothing
-      // to do with the layer being filled. Building an isolated render of ONLY the active layer's
-      // own strokes here — reusing the exact same bake/composite machinery already used for frozen
-      // strokes and exports — means the flood fill now only ever reacts to that one layer's actual
-      // content, same as the reference project's fill (which likewise re-renders just the active
-      // layer, not the whole scene, before flood-filling it).
-      const isoData = new Uint8ClampedArray(w * h * 4);
-      // Transparent canvases read as (0,0,0,0) everywhere by default — flood-filling from a point
-      // with nothing painted there needs that to compare as "the background", not silently match
-      // every other untouched transparent pixel by coincidence, so seed it with the same background
-      // color (#080a12) the main buffer starts each frame from.
-      for (let i = 0; i < isoData.length; i += 4) {
-        isoData[i] = 8; isoData[i + 1] = 10; isoData[i + 2] = 18; isoData[i + 3] = 255;
-      }
-      const nowIso = performance.now();
-      for (const st of layerF.strokes) {
-        if (st.frozen && st.bakedCache && st.bakedCache.pointCount === st.points.length) {
-          compositeBakedStroke(isoData, st.bakedCache);
-        } else {
-          const isoTarget: PaintTarget = { mode: "buffer", buf: isoData, bw: w, bh: h };
-          renderStroke(isoTarget, st, w, h, nowIso / 1000, 16, nowIso, FULL_QUALITY_OPTS);
+
+      // === Рисуем только текущий слой отдельно, без других слоёв ===
+      const tmpBuf = new Uint8ClampedArray(w * h * 4);
+      tmpBuf.fill(0);
+      const tmpTarget: PaintTarget = {
+        mode: "buffer",
+        buf: tmpBuf,
+        buf32: new Uint32Array(tmpBuf.buffer),
+        bw: w,
+        bh: h
+      };
+
+      // Картинка слоя
+      if (layerF.image) {
+        const imgPixels = ensureLayerImagePixels(layerF, w, h);
+        if (imgPixels) {
+          for (let i = 0; i < imgPixels.length; i++) {
+            tmpBuf[i] = imgPixels[i];
+          }
         }
       }
-      const mask = computeFloodMask(isoData, w, h, sx, sy, refs.fillTolerance.current, refs.fillContiguous.current);
-      // Re-filling the same spot used to just stack another animated fill stroke on top forever —
-      // every earlier fill of that area stayed alive, fully hidden under the new one but still
-      // fully rendered (and for gradient/rainbow, fully re-animated: its own per-pixel ramp +
-      // bbox loop) every single frame from then on. Click fill in the same place 5 times and 5
-      // fills' worth of invisible-but-not-free work was happening every frame forever after. A real
-      // bucket-fill tool REPLACES what was there — so any existing fill on this layer whose mask
-      // already covers the point just clicked is removed here: you're standing inside it, so it's
-      // about to be completely covered by the new one anyway.
+
+      // Все мазки текущего слоя
+      const nowF = performance.now();
+      for (const s of layerF.strokes) {
+        if (s.points.length === 0) continue;
+        const effT = s.frozen ? s.born / 1000 : nowF / 1000;
+        const effDt = s.frozen ? 0 : 16;
+        const effNow = s.frozen ? s.born : nowF;
+        renderStroke(tmpTarget, s, w, h, effT, effDt, effNow, FULL_QUALITY_OPTS);
+      }
+      // === Конец отдельного рендера ===
+
+      // Заливка смотрит только на текущий слой, а не на весь экран
+      const mask = computeFloodMask(tmpBuf, w, h, sx, sy, refs.fillTolerance.current, refs.fillContiguous.current);
+
+      // Удаляем старые заливки в этой же точке
       for (let i = layerF.strokes.length - 1; i >= 0; i--) {
         const old = layerF.strokes[i];
         if (old.kind !== "fill" || old.fillW !== w || old.fillH !== h) continue;
         const oldMask = old.fillMaskCache ?? (old.fillRuns ? decodeMaskRLE(old.fillRuns, w * h) : null);
         if (oldMask && oldMask[sy * w + sx]) layerF.strokes.splice(i, 1);
       }
+
       const fillStroke: Stroke = {
         id: ++strokeIdCounter,
         kind: "fill",
@@ -2455,8 +2153,6 @@ function IndexInner() {
         gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
         gradientAngle: refs.gradientAngle.current,
         frozen: !refs.animEnabled.current,
-        // Single point, purely so the generic "empty stroke" skip-checks elsewhere don't drop this
-        // fill — its actual painted area comes entirely from fillRuns, never from points/segments.
         points: [{ x: sx, y: sy, t: 0 }],
         born: performance.now(),
         fillRuns: encodeMaskRLE(mask),
@@ -3154,18 +2850,6 @@ function IndexInner() {
                     className="w-full accent-white"
                     title="Тяжесть этого цвета в смеси"
                   />
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    value={Math.round((c.alpha ?? 1) * 100)}
-                    onChange={(e) => {
-                      const alpha = +e.target.value / 100;
-                      setGradientColors(cols => cols.map((cc, ci) => ci === i ? { ...cc, alpha } : cc));
-                    }}
-                    className="w-full accent-white"
-                    title="Прозрачность этого цвета"
-                  />
                   <span className="w-8 shrink-0 text-right text-[10px] tabular-nums text-white/50">{sharePct}%</span>
                   {gradientColors.length > 2 && (
                     <button
@@ -3181,7 +2865,7 @@ function IndexInner() {
               })}
               {gradientColors.length < 6 && (
                 <button
-                  onClick={() => setGradientColors(cols => [...cols, { hue: Math.round(Math.random() * 360), weight: 1, alpha: 1 }])}
+                  onClick={() => setGradientColors(cols => [...cols, { hue: Math.round(Math.random() * 360), weight: 1 }])}
                   className="w-full rounded border border-dashed border-white/30 py-1 text-[10px] text-white/50 hover:border-white/60 hover:text-white"
                 >
                   + Добавить цвет
