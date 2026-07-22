@@ -50,6 +50,13 @@ interface Stroke {
   // Rainbow and gradient modes keep their own separate speed sliders (rainbowFlowSpeed/gradientSpeed)
   // unchanged; this only applies to modes that had no speed control of their own at all.
   modeSpeed: number;
+  // "Режим актив" modifiers — independent of `mode` above (which stays exclusive: normal/rainbow/
+  // gradient/glitch/rgbShift/chrome). These three can combine freely with `mode` AND with each
+  // other (e.g. gradient + pulse + mirror at once), so they're their own booleans rather than
+  // additional ModeKind values.
+  pulseOn: boolean;
+  mirrorOn: boolean;
+  sprayOn: boolean;
   rainbowFlow: boolean;
   rainbowFlowSpeed: number;
   rainbowBlinkSpeed: number;
@@ -149,12 +156,20 @@ const MODES: { id: ModeKind; label: string }[] = [
   { id: "normal", label: "Обычный" },
   { id: "rainbow", label: "Радуга" },
   { id: "gradient", label: "Градиент" },
-  { id: "pulse", label: "Пульс" },
-  { id: "spray", label: "Распыление" },
-  { id: "mirror", label: "Зеркало" },
   { id: "glitch", label: "Глитч" },
   { id: "rgbShift", label: "RGB сдвиг" },
   { id: "chrome", label: "Хром" },
+];
+
+// "Режим актив" — модификаторы, не эксклюзивные с основным списком Режим выше и друг с другом.
+// В отличие от MODES (только один активен за раз, хранится в Stroke.mode), каждый из них — свой
+// независимый булев флаг на штрихе (Stroke.pulseOn/mirrorOn/sprayOn), так что их можно скрещивать:
+// например Градиент + Пульс + Зеркало одновременно.
+type ActiveModKind = "pulse" | "mirror" | "spray";
+const ACTIVE_MODS: { id: ActiveModKind; label: string }[] = [
+  { id: "pulse", label: "Пульс" },
+  { id: "mirror", label: "Зеркало" },
+  { id: "spray", label: "Распыление" },
 ];
 
 const GIF_PRESETS = {
@@ -777,6 +792,7 @@ function serializeStroke(s: Stroke): string {
     id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue,
     speed: s.speed, density: s.density, noise: s.noise,
     intensity: s.intensity, dynamics: s.dynamics, modeSpeed: s.modeSpeed,
+    pulseOn: s.pulseOn, mirrorOn: s.mirrorOn, sprayOn: s.sprayOn,
     rainbowFlow: s.rainbowFlow, rainbowFlowSpeed: s.rainbowFlowSpeed, rainbowBlinkSpeed: s.rainbowBlinkSpeed, gradientSpeed: s.gradientSpeed, gradientScale: s.gradientScale,
     gradientColors: s.gradientColors, gradientAngle: s.gradientAngle,
     frozen: s.frozen,
@@ -984,6 +1000,10 @@ function IndexInner() {
   const [intensity, setIntensity] = useState(0.7);
   const [dynamics, setDynamics] = useState(0.5);
   const [modeSpeed, setModeSpeed] = useState(0.5);
+  // "Режим актив" — independent toggles, combinable with `mode` and with each other.
+  const [pulseOn, setPulseOn] = useState(false);
+  const [mirrorOn, setMirrorOn] = useState(false);
+  const [sprayOn, setSprayOn] = useState(false);
   const [rainbowFlow, setRainbowFlow] = useState(true);
   const [rainbowFlowSpeed, setRainbowFlowSpeed] = useState(0.5);
   const [rainbowBlinkSpeed, setRainbowBlinkSpeed] = useState(0.5);
@@ -1173,6 +1193,9 @@ function IndexInner() {
     speed: useRef(speed), density: useRef(density), noise: useRef(noise),
     intensity: useRef(intensity), dynamics: useRef(dynamics),
     modeSpeed: useRef(modeSpeed),
+    pulseOn: useRef(pulseOn),
+    mirrorOn: useRef(mirrorOn),
+    sprayOn: useRef(sprayOn),
     rainbowFlow: useRef(rainbowFlow),
     rainbowFlowSpeed: useRef(rainbowFlowSpeed),
     rainbowBlinkSpeed: useRef(rainbowBlinkSpeed),
@@ -1192,6 +1215,9 @@ function IndexInner() {
   useEffect(() => { refs.intensity.current = intensity; });
   useEffect(() => { refs.dynamics.current = dynamics; });
   useEffect(() => { refs.modeSpeed.current = modeSpeed; });
+  useEffect(() => { refs.pulseOn.current = pulseOn; });
+  useEffect(() => { refs.mirrorOn.current = mirrorOn; });
+  useEffect(() => { refs.sprayOn.current = sprayOn; });
   useEffect(() => { refs.rainbowFlow.current = rainbowFlow; });
   useEffect(() => { refs.rainbowFlowSpeed.current = rainbowFlowSpeed; });
   useEffect(() => { refs.rainbowBlinkSpeed.current = rainbowBlinkSpeed; });
@@ -1415,7 +1441,7 @@ function IndexInner() {
     // "Мигание целиком" gets the new adjustable rate, defaulting to 0.5*0.1=0.05 so nothing changes
     // until the slider is actually moved.
     const modeHueShift = s.mode === "rainbow" ? (lifeMs * (s.rainbowFlow ? 0.05 : s.rainbowBlinkSpeed * 0.1)) % 360 : 0;
-    const modePulse = s.mode === "pulse" ? 0.6 + 0.5 * Math.sin(mt * (0.5 + ms * 3)) : 1;
+    const modePulse = s.pulseOn ? 0.6 + 0.5 * Math.sin(mt * (0.5 + ms * 3)) : 1;
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
     const pts = s.points;
     // "Радуга: Поток" keeps its original simple full-spectrum sweep, unchanged.
@@ -1586,7 +1612,7 @@ function IndexInner() {
     // silently ignored the mode entirely, which is what read as "spray doesn't work". Ink keeps its
     // own dedicated airbrush scatter (see isSpray below); every OTHER brush now gets the generic
     // paint()-level scatter turned on for its whole render pass instead.
-    const spraySet = s.mode === "spray" && s.kind !== "ink";
+    const spraySet = !!s.sprayOn && s.kind !== "ink";
     if (spraySet) {
       target.spray = Math.max(2, s.size * (0.3 + s.density * 0.6));
       // Was a hardcoded 0.55 no matter what — "Плотность" had zero effect on how sparse/dense the
@@ -1656,7 +1682,7 @@ function IndexInner() {
       // dots with a soft falloff toward the edges, like paint from an airbrush, instead of a
       // uniform evenly-stepped fill. Base thickness no longer gets the flat multiplier since the
       // scatter radius below handles reach on its own.
-      const isSpray = s.mode === "spray";
+      const isSpray = !!s.sprayOn;
       const thickness = Math.max(grid, s.size * (0.45 + s.intensity * 0.55) * modePulse);
       const half = thickness / 2;
       const phaseI = s.ink.phase;
@@ -1824,60 +1850,46 @@ function IndexInner() {
       if (pts.length < 2) return;
       const grid = Math.max(2, Math.round(s.size / 6));
       const stepPts = Math.max(1, Math.floor(pts.length / 30));
-      // PERF: adapted from a lighter reference implementation. The previous version computed a
-      // per-point direction vector for every slice — getSegCache lookup, Math.hypot, a divide to
-      // normalize, then rotating a tangent/normal pair — so the glitch bars could "follow" the
-      // stroke's own path direction (the "Динамика"-as-follow feature). That's real, measurable
-      // per-point trig cost, and it's the main reason this brush ran heavier than the others.
-      // Dropping direction-follow and going back to a fixed horizontal pose (bars always stack
-      // vertically, slices always extend along X — same as ink/ribbon's simpler axis-aligned math)
-      // removes the seg-cache call, the hypot, the normalize, and the tx/ty rotation entirely, at
-      // the cost of the bars no longer tilting to match diagonal strokes — a fair trade for real
-      // perf headroom on this specific brush. "Динамика" goes back to controlling only reach/radius
-      // (its original, cheaper meaning), same as every other brush's dynamics slider.
+      // RESTORED: direction-follow. Slices are built in the stroke's own local frame (tangent
+      // tx,ty along the path, normal nx,ny) instead of a fixed horizontal pose — bars tilt to
+      // match diagonal strokes again. Reuses the same cached per-segment geometry ink/ribbon
+      // already build (getSegCache), so this doesn't cost a fresh hypot/normalize per point.
+      const segs = getSegCache(s, pts, grid);
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
         const hueG = hueAt(pi);
         const radius = s.size * (0.8 + s.dynamics * 1.5);
         const slices = 3 + Math.floor(s.density * 8);
+        const seg = segs[Math.min(pi, segs.length - 1)];
+        const nx = seg ? seg.nx : 0, ny = seg ? seg.ny : 1;
+        const tx = ny, ty = -nx; // tangent = normal rotated back 90°
+        // EXPLICIT real R/G/B channel split (chromatic-aberration style), baked back into the
+        // brush itself — not a hue-rotation trick. Independent of whatever "Глитч"/"RGB сдвиг"
+        // MODE is active (that generic logic in paint()/paintRGB stays untouched; this calls
+        // paintChannel directly so the two never stack/compound). The offset runs along the
+        // stroke's own tangent so the fringing reads as smeared in the direction of motion.
+        const [r, g, b] = getHslRgb(hueG, 100, 55);
+        const chOff = grid * (1.4 + s.intensity);
+        const dxOff = tx * chOff, dyOff = ty * chOff;
         for (let i = 0; i < slices; i++) {
           const yOff = (i / slices - 0.5) * radius * 2;
           const shift = (hash(Math.floor(tt * 8) + i + p.t) * 2) * s.size * (0.3 + s.noise * 2);
           const widthLine = radius * 2 * (0.6 + Math.random() * 0.4);
-          const startX = p.x - widthLine / 2 + shift;
-          const y0 = Math.round((p.y + yOff) / grid + gridPhaseY) * grid;
-          // Per feedback: color moved OUT of this brush entirely and into the "Глитч" MODE (see
-          // target.glitchSplit in paint()/renderStroke) — this brush only shapes the slices now
-          // (position/width/count/density), exactly like every other brush. The triple pass at
-          // [-grid,0,grid] is shape/density (three interleaved offset copies per slice — dropping
-          // it read as too smooth, see earlier fix), NOT color. BUT: in "Глитч" mode specifically,
-          // paint() ALREADY triples every single call into three offset+tinted copies on its own
-          // (target.glitchSplit) — stacking that on top of this brush's own triple pass compounded
-          // into 9 small scattered blocks per step instead of 3, which is exactly what read as
-          // faded/washed out (same total ink spread over 3x the positions). So: skip this brush's
-          // own tripling specifically when "Глитч" is active (paint()'s tripling already covers
-          // it) and keep it for every other mode, where paint() does nothing extra on its own.
-          if (glitchOn) {
-            for (let xb = 0; xb < widthLine; xb += grid) {
-              if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-              paint(target, Math.round((startX + xb) / grid + gridPhaseX) * grid, y0, grid, grid, hueG, 100, 55, alphaMul * 0.55);
-            }
-          } else {
-            // BUG FIX ("глитч теряет текстуру, виден только силуэт" под любым режимом, кроме
-            // самого "Глитч"): the keep/skip coin-flip used to be rolled SEPARATELY for each of the
-            // 3 offset copies. At ~60% keep chance per copy, the odds that at LEAST ONE of the 3
-            // copies survives is ~93% — so almost every cell along the slice got painted by one
-            // copy or another, and the intentionally sparse, broken glitch texture collapsed into a
-            // near-solid block. Rolling the coin ONCE per position (shared by all 3 offset copies at
-            // that spot) keeps the sparsity ratio identical to the glitchOn branch above, while
-            // still getting the intended 3-copy-thick shape wherever a cell IS kept.
-            const offs = [-grid, 0, grid];
-            for (let xb = 0; xb < widthLine; xb += grid) {
-              if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-              for (let c2 = 0; c2 < 3; c2++) {
-                paint(target, Math.round((startX + xb + offs[c2]) / grid + gridPhaseX) * grid, y0, grid, grid, hueG, 100, 55, alphaMul * 0.55);
-              }
-            }
+          // base position built in local (tangent, normal) space instead of raw x/y — `shift`
+          // runs along the tangent, `yOff` stacks slices along the normal, so the whole slice
+          // rotates with the stroke instead of always sitting flat/horizontal.
+          const baseX = p.x + tx * shift + nx * yOff;
+          const baseY = p.y + ty * shift + ny * yOff;
+          const startX = baseX - widthLine / 2;
+          const y0r = Math.round(baseY / grid + gridPhaseY) * grid;
+          // RESTORED original texture: keep/skip rolled INDEPENDENTLY per channel copy again
+          // (like the reference brush), instead of one shared roll for all three — that's what
+          // gives back the sparse, broken-apart look instead of a smoother silhouette.
+          for (let xb = 0; xb < widthLine; xb += grid) {
+            const xr = Math.round((startX + xb) / grid + gridPhaseX) * grid;
+            if (Math.random() <= 0.4 + s.intensity * 0.5) paintChannel(target, xr - dxOff, y0r - dyOff, grid, grid, 0, r, alphaMul * 0.55);
+            if (Math.random() <= 0.4 + s.intensity * 0.5) paintChannel(target, xr, y0r, grid, grid, 1, g, alphaMul * 0.55);
+            if (Math.random() <= 0.4 + s.intensity * 0.5) paintChannel(target, xr + dxOff, y0r + dyOff, grid, grid, 2, b, alphaMul * 0.55);
           }
         }
       }
@@ -2139,7 +2151,7 @@ function IndexInner() {
     if (!s) return;
     const now = performance.now();
     s.points.push({ x, y, t: (now - s.born) / 1000, pressure });
-    if (s.mode === "mirror") {
+    if (s.mirrorOn) {
       s.points.push({ x: canvasSize.w - x, y, t: (now - s.born) / 1000, pressure });
     }
     if (s.points.length > MAX_POINTS_PER_STROKE) {
@@ -2272,6 +2284,9 @@ function IndexInner() {
         intensity: refs.intensity.current,
         dynamics: refs.dynamics.current,
         modeSpeed: refs.modeSpeed.current,
+        pulseOn: refs.pulseOn.current,
+        mirrorOn: refs.mirrorOn.current,
+        sprayOn: refs.sprayOn.current,
         rainbowFlow: refs.rainbowFlow.current,
         rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
         rainbowBlinkSpeed: refs.rainbowBlinkSpeed.current,
@@ -2305,6 +2320,9 @@ function IndexInner() {
       intensity: refs.intensity.current,
       dynamics: refs.dynamics.current,
       modeSpeed: refs.modeSpeed.current,
+      pulseOn: refs.pulseOn.current,
+      mirrorOn: refs.mirrorOn.current,
+      sprayOn: refs.sprayOn.current,
       rainbowFlow: refs.rainbowFlow.current,
       rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
       rainbowBlinkSpeed: refs.rainbowBlinkSpeed.current,
@@ -2966,11 +2984,27 @@ function IndexInner() {
               <ParamSlider label="Скорость мигания" value={rainbowBlinkSpeed} set={setRainbowBlinkSpeed} />
             </div>
           )}
-          {(mode === "pulse" || mode === "glitch" || mode === "rgbShift") && (
+          {(pulseOn || mode === "glitch" || mode === "rgbShift") && (
             <div className="mt-2 border-t border-white/10 pt-2">
               <ParamSlider label="Скорость режима" value={modeSpeed} set={setModeSpeed} />
             </div>
           )}
+        </section>
+
+        {/* Режим актив — независимые модификаторы: каждый включается/выключается сам по себе и
+            скрещивается как с основным Режимом выше (Обычный/Радуга/Градиент/Глитч/RGB сдвиг/Хром),
+            так и друг с другом (например Градиент + Пульс + Зеркало одновременно). */}
+        <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
+          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Режим актив</div>
+          <div className="grid grid-cols-3 gap-1">
+            {ACTIVE_MODS.map(m => {
+              const active = m.id === "pulse" ? pulseOn : m.id === "mirror" ? mirrorOn : sprayOn;
+              const toggle = m.id === "pulse" ? () => setPulseOn(v => !v) : m.id === "mirror" ? () => setMirrorOn(v => !v) : () => setSprayOn(v => !v);
+              return (
+                <button key={m.id} onClick={toggle} className={`rounded border px-1.5 py-1 text-[9px] uppercase tracking-widest transition ${active ? "border-white/60 bg-white/10" : "border-white/5 text-white/40 hover:text-white/80"}`}>{m.label}</button>
+              );
+            })}
+          </div>
         </section>
 
         {/* Dedicated Gradient tool menu — only visible while the Gradient mode is active */}
