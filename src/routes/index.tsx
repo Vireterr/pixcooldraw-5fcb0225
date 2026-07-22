@@ -1850,10 +1850,11 @@ function IndexInner() {
       if (pts.length < 2) return;
       const grid = Math.max(2, Math.round(s.size / 6));
       const stepPts = Math.max(1, Math.floor(pts.length / 30));
-      // RESTORED: direction-follow. Slices are built in the stroke's own local frame (tangent
-      // tx,ty along the path, normal nx,ny) instead of a fixed horizontal pose — bars tilt to
-      // match diagonal strokes again. Reuses the same cached per-segment geometry ink/ribbon
-      // already build (getSegCache), so this doesn't cost a fresh hypot/normalize per point.
+      // dynamics now doubles as "how much this brush follows the stroke's own direction": 0 keeps
+      // the slices in the original fixed horizontal pose (nx=0,ny=1 — same as before direction
+      // tracking existed), and increasing values blend smoothly toward fully following the local
+      // path direction. So dynamics no longer only controls radius — it's the one knob for both
+      // reach and how "aware" the glitch is of the stroke's own movement.
       const segs = getSegCache(s, pts, grid);
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
@@ -1861,35 +1862,49 @@ function IndexInner() {
         const radius = s.size * (0.8 + s.dynamics * 1.5);
         const slices = 3 + Math.floor(s.density * 8);
         const seg = segs[Math.min(pi, segs.length - 1)];
-        const nx = seg ? seg.nx : 0, ny = seg ? seg.ny : 1;
-        const tx = ny, ty = -nx; // tangent = normal rotated back 90°
-        // EXPLICIT real R/G/B channel split (chromatic-aberration style), baked back into the
-        // brush itself — not a hue-rotation trick. Independent of whatever "Глитч"/"RGB сдвиг"
-        // MODE is active (that generic logic in paint()/paintRGB stays untouched; this calls
-        // paintChannel directly so the two never stack/compound). The offset runs along the
-        // stroke's own tangent so the fringing reads as smeared in the direction of motion.
-        const [r, g, b] = getHslRgb(hueG, 100, 55);
-        const chOff = grid * (1.4 + s.intensity);
-        const dxOff = tx * chOff, dyOff = ty * chOff;
+        const followT = Math.max(0, Math.min(1, s.dynamics));
+        const nx0 = 0, ny0 = 1; // static pose: bars stack vertically, extend horizontally
+        const nx1 = seg ? seg.nx : nx0, ny1 = seg ? seg.ny : ny0;
+        let nx = nx0 * (1 - followT) + nx1 * followT;
+        let ny = ny0 * (1 - followT) + ny1 * followT;
+        const nlen = Math.hypot(nx, ny) || 1;
+        nx /= nlen; ny /= nlen;
+        const tx = ny, ty = -nx; // tangent = normal rotated 90°
         for (let i = 0; i < slices; i++) {
           const yOff = (i / slices - 0.5) * radius * 2;
           const shift = (hash(Math.floor(tt * 8) + i + p.t) * 2) * s.size * (0.3 + s.noise * 2);
           const widthLine = radius * 2 * (0.6 + Math.random() * 0.4);
-          // base position built in local (tangent, normal) space instead of raw x/y — `shift`
-          // runs along the tangent, `yOff` stacks slices along the normal, so the whole slice
-          // rotates with the stroke instead of always sitting flat/horizontal.
-          const baseX = p.x + tx * shift + nx * yOff;
-          const baseY = p.y + ty * shift + ny * yOff;
-          const startX = baseX - widthLine / 2;
-          const y0r = Math.round(baseY / grid + gridPhaseY) * grid;
-          // RESTORED original texture: keep/skip rolled INDEPENDENTLY per channel copy again
-          // (like the reference brush), instead of one shared roll for all three — that's what
-          // gives back the sparse, broken-apart look instead of a smoother silhouette.
-          for (let xb = 0; xb < widthLine; xb += grid) {
-            const xr = Math.round((startX + xb) / grid + gridPhaseX) * grid;
-            if (Math.random() <= 0.4 + s.intensity * 0.5) paintChannel(target, xr - dxOff, y0r - dyOff, grid, grid, 0, r, alphaMul * 0.55);
-            if (Math.random() <= 0.4 + s.intensity * 0.5) paintChannel(target, xr, y0r, grid, grid, 1, g, alphaMul * 0.55);
-            if (Math.random() <= 0.4 + s.intensity * 0.5) paintChannel(target, xr + dxOff, y0r + dyOff, grid, grid, 2, b, alphaMul * 0.55);
+          const baseX = p.x + nx * yOff, baseY = p.y + ny * yOff;
+          const startX = baseX - tx * (widthLine / 2) + tx * shift;
+          const startY = baseY - ty * (widthLine / 2) + ty * shift;
+          // Color lives in the "Глитч"/"RGB сдвиг" MODES (target.glitchSplit/target.rgbShift in
+          // paint()/paintRGB) — this brush only shapes the slices (position/width/count/density),
+          // exactly like every other brush, and calls plain paint() so it actually goes through
+          // and reacts to whichever mode is active. The triple pass at [-grid,0,grid] is
+          // shape/density (three interleaved offset copies per slice), NOT color. In "Глитч" mode
+          // specifically, paint() ALREADY triples every call into three offset+tinted copies on
+          // its own (target.glitchSplit) — stacking that on top of this brush's own triple pass
+          // would compound into 9 small scattered blocks per step instead of 3 (faded/washed out).
+          // So: skip this brush's own tripling specifically when "Глитч" is active and keep it for
+          // every other mode, where paint() does nothing extra on its own.
+          if (glitchOn) {
+            for (let xb = 0; xb < widthLine; xb += grid) {
+              if (Math.random() > 0.4 + s.intensity * 0.5) continue;
+              const px = startX + tx * xb, py = startY + ty * xb;
+              paint(target, Math.round(px / grid + gridPhaseX) * grid, Math.round(py / grid + gridPhaseY) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+            }
+          } else {
+            // Keep/skip rolled INDEPENDENTLY per offset copy (not a single shared roll) — this is
+            // what gives the sparse, broken-apart glitch texture instead of a smoother silhouette.
+            const offs = [-grid, 0, grid];
+            for (let c2 = 0; c2 < 3; c2++) {
+              for (let xb = 0; xb < widthLine; xb += grid) {
+                if (Math.random() > 0.4 + s.intensity * 0.5) continue;
+                const off = xb + offs[c2];
+                const px = startX + tx * off, py = startY + ty * off;
+                paint(target, Math.round(px / grid + gridPhaseX) * grid, Math.round(py / grid + gridPhaseY) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+              }
+            }
           }
         }
       }
