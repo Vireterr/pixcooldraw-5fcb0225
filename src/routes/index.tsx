@@ -583,18 +583,9 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
   // generically at the shared color-plotting call site instead of that one brush's bespoke loop.
   if (target.rgbShift) {
     const off = target.rgbShift;
-    // Small per-call vertical jitter on the R/B copies (G stays put as the "anchor" channel) —
-    // without this every pixel's split sat on the exact same horizontal line, reading as one
-    // uniform clean fringe no matter how big `off` got. A little vertical scatter breaks that
-    // straight-line look into something torn/uneven, closer to a real bad-signal misregistration.
-    const jitR = (Math.random() - 0.5) * off * 0.7;
-    const jitB = (Math.random() - 0.5) * off * 0.7;
-    // BUG FIX: was paintRGB(..., r,0,0), paintRGB(..., 0,g,0), paintRGB(..., 0,0,b) — see
-    // paintChannel's comment above for why that compounded into a muddy, desaturated blob instead
-    // of clean fringing. paintChannel touches only the one channel each offset is responsible for.
-    paintChannel(target, x - off, y + jitR, sizeW, sizeH, 0, r, a);
-    paintChannel(target, x, y, sizeW, sizeH, 1, g, a);
-    paintChannel(target, x + off, y + jitB, sizeW, sizeH, 2, b, a);
+    paintRGB(target, x - off, y, sizeW, sizeH, r, 0, 0, a);
+    paintRGB(target, x, y, sizeW, sizeH, 0, g, 0, a);
+    paintRGB(target, x + off, y, sizeW, sizeH, 0, 0, b, a);
     return;
   }
   if (target.mode === "ctx") {
@@ -1905,9 +1896,11 @@ function IndexInner() {
       if (pts.length < 2) return;
       const grid = Math.max(2, Math.round(s.size / 6));
       const stepPts = Math.max(1, Math.floor(pts.length / 30));
-      // dynamics doubles as "how much this brush follows the stroke's own direction": 0 keeps the
-      // slices in the fixed horizontal pose (nx=0,ny=1), increasing values blend smoothly toward
-      // fully following the local path direction.
+      // dynamics now doubles as "how much this brush follows the stroke's own direction": 0 keeps
+      // the slices in the original fixed horizontal pose (nx=0,ny=1 — same as before direction
+      // tracking existed), and increasing values blend smoothly toward fully following the local
+      // path direction. So dynamics no longer only controls radius — it's the one knob for both
+      // reach and how "aware" the glitch is of the stroke's own movement.
       const segs = getSegCache(s, pts, grid);
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
@@ -1930,14 +1923,17 @@ function IndexInner() {
           const baseX = p.x + nx * yOff, baseY = p.y + ny * yOff;
           const startX = baseX - tx * (widthLine / 2) + tx * shift;
           const startY = baseY - ty * (widthLine / 2) + ty * shift;
-          // Color lives in the "Глитч"/"RGB сдвиг" MODES (target.glitchSplit/target.rgbShift in
-          // paint()) — this brush only shapes the slices (position/width/count/density), the same
-          // way every other brush does, and calls plain paint() so it reacts to whichever mode is
-          // active. In "Глитч" mode paint() ALREADY triples every call into three offset+tinted
-          // copies on its own (target.glitchSplit) — stacking that on top of this brush's own
-          // triple pass would compound into 9 small scattered blocks per step instead of 3. So:
-          // skip this brush's own tripling specifically when "Глитч" is active, keep it for every
-          // other mode (where paint() does nothing extra on its own).
+          // Per feedback: color moved OUT of this brush entirely and into the "Глитч" MODE (see
+          // target.glitchSplit in paint()/renderStroke) — this brush only shapes the slices now
+          // (position/width/count/density), exactly like every other brush. The triple pass at
+          // [-grid,0,grid] is shape/density (three interleaved offset copies per slice — dropping
+          // it read as too smooth, see earlier fix), NOT color. BUT: in "Глитч" mode specifically,
+          // paint() ALREADY triples every single call into three offset+tinted copies on its own
+          // (target.glitchSplit) — stacking that on top of this brush's own triple pass compounded
+          // into 9 small scattered blocks per step instead of 3, which is exactly what read as
+          // faded/washed out (same total ink spread over 3x the positions). So: skip this brush's
+          // own tripling specifically when "Глитч" is active (paint()'s tripling already covers
+          // it) and keep it for every other mode, where paint() does nothing extra on its own.
           if (glitchOn) {
             for (let xb = 0; xb < widthLine; xb += grid) {
               if (Math.random() > 0.4 + s.intensity * 0.5) continue;
