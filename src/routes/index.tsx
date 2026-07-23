@@ -540,14 +540,19 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
   // into an unrelated hue that fights the color you chose.
   if (target.chromeFreq) {
     const proj = (x * (target.chromeCos ?? 1) + y * (target.chromeSin ?? 0)) * target.chromeFreq + (target.chromePhase ?? 0);
-    const band = Math.sin(proj);
+    const raw = Math.sin(proj); // -1..1
+    // FIX ("никакого эффекта металла"): a plain sine gives two equal-width bands — bright half,
+    // dark half — which reads as flat striping, not a reflection. Real specular highlights are
+    // narrow and sharp; the surrounding shadow is broad and gentle. Power-curving the highlight
+    // side (steep falloff) against a gentler curve on the shadow side turns the same wave into a
+    // thin bright glint traveling over a broad darker metal base — an actual sheen, not a stripe.
+    const hi = Math.pow(Math.max(0, raw), 3);   // narrow, sharp highlight
+    const lo = Math.pow(Math.max(0, -raw), 1.3); // broad, soft shadow
     const colorAmt = target.chromeColorAmt ?? 0;
     const colorBand = Math.sin(proj * 1.7 + 2.1);
     h = h + colorBand * 25 * colorAmt;
-    const hi = Math.max(0, band);  // 0..1 toward the highlight
-    const lo = Math.max(0, -band); // 0..1 toward the shadow
-    l = Math.max(4, Math.min(97, l * 0.4 + 50 + hi * 45 - lo * 30));
-    s = Math.max(0, Math.min(100, s * (0.7 + lo * 0.55 - hi * 0.45)));
+    l = Math.max(4, Math.min(97, l * 0.35 + 45 + hi * 55 - lo * 28));
+    s = Math.max(0, Math.min(100, s * (0.65 + lo * 0.5 - hi * 0.5)));
   }
   const [r, g, b] = getHslRgb(h, s, l);
   // Generic "Глитч" mode: paint the SAME call three times, tinted 0°/+120°/+240° off the real
@@ -571,12 +576,18 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
   // generically at the shared color-plotting call site instead of that one brush's bespoke loop.
   if (target.rgbShift) {
     const off = target.rgbShift;
+    // Small per-call vertical jitter on the R/B copies (G stays put as the "anchor" channel) —
+    // without this every pixel's split sat on the exact same horizontal line, reading as one
+    // uniform clean fringe no matter how big `off` got. A little vertical scatter breaks that
+    // straight-line look into something torn/uneven, closer to a real bad-signal misregistration.
+    const jitR = (Math.random() - 0.5) * off * 0.7;
+    const jitB = (Math.random() - 0.5) * off * 0.7;
     // BUG FIX: was paintRGB(..., r,0,0), paintRGB(..., 0,g,0), paintRGB(..., 0,0,b) — see
     // paintChannel's comment above for why that compounded into a muddy, desaturated blob instead
     // of clean fringing. paintChannel touches only the one channel each offset is responsible for.
-    paintChannel(target, x - off, y, sizeW, sizeH, 0, r, a);
+    paintChannel(target, x - off, y + jitR, sizeW, sizeH, 0, r, a);
     paintChannel(target, x, y, sizeW, sizeH, 1, g, a);
-    paintChannel(target, x + off, y, sizeW, sizeH, 2, b, a);
+    paintChannel(target, x + off, y + jitB, sizeW, sizeH, 2, b, a);
     return;
   }
   if (target.mode === "ctx") {
@@ -767,6 +778,23 @@ function strokeAutoAngleDeg(pts: StrokePoint[]): number {
   const dx = p1.x - p0.x, dy = p1.y - p0.y;
   if (Math.hypot(dx, dy) < 1) return 0;
   return ((Math.atan2(dy, dx) * 180) / Math.PI + 360) % 360;
+}
+
+// Direction AND travelled length of the actual drawn path — unlike strokeAutoAngleDeg above
+// (which only looks at the start/end chord, so a curved or zigzag stroke gets a near-random
+// direction), this sums every segment's own vector, so the result follows the stroke's real
+// overall flow instead of a straight line between its two endpoints. Used by "Хром" so its
+// highlight sweep tracks the actual movement of the hand, not an arbitrary chord.
+function strokeFlowVector(pts: StrokePoint[]): { cos: number; sin: number; len: number } {
+  if (pts.length < 2) return { cos: 1, sin: 0, len: 0 };
+  let sx = 0, sy = 0, len = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const dx = pts[i].x - pts[i - 1].x, dy = pts[i].y - pts[i - 1].y;
+    sx += dx; sy += dy;
+    len += Math.hypot(dx, dy);
+  }
+  const mag = Math.hypot(sx, sy) || 1;
+  return { cos: sx / mag, sin: sy / mag, len };
 }
 
 let strokeIdCounter = 0;
@@ -1620,13 +1648,16 @@ function IndexInner() {
       target.sprayKeep = 0.25 + s.density * 0.6;
     }
     // "RGB сдвиг" mode — generic real channel-split, works with ANY brush (unlike the pixelGlitch
-    // brush's own built-in split, which only fires for that one brush). Offset reach follows
-    // "Динамика" (same knob the pixelGlitch brush uses for its own reach), and gently breathes over
-    // time at the "Скорость режима" rate so it reads as a live flicker instead of a static fringe.
+    // brush's own built-in split, which only fires for that one brush). REWORKED: the old version
+    // was a single smooth horizontal offset that gently breathed — clean, but read as a flat,
+    // static chromatic-aberration fringe rather than an actual glitch. Now: bigger base reach,
+    // occasional sharp "tear" spikes (a short jump to a much bigger offset, like a dropped frame)
+    // layered on top of the breathing, so it reads as unstable/live instead of a fixed filter.
     const rgbShiftSet = s.mode === "rgbShift";
     if (rgbShiftSet) {
       const breathe = 0.5 + 0.5 * Math.sin(mt * (0.5 + ms * 3));
-      target.rgbShift = Math.max(1, s.size * (0.05 + s.dynamics * 0.35) * (0.4 + breathe * 0.6));
+      const tear = Math.random() < 0.05 + ms * 0.05 ? 1.8 + Math.random() * 1.4 : 1;
+      target.rgbShift = Math.max(1, s.size * (0.08 + s.dynamics * 0.6) * (0.35 + breathe * 0.85) * tear);
     }
     // "Глитч" mode — generic spatial tri-hue split, works with ANY brush the same way it used to
     // work only for the pixelGlitch brush. FIX: this used to scale up with "Динамика" (up to
@@ -1642,19 +1673,22 @@ function IndexInner() {
       target.glitchSplit = 1.5 * jitter;
     }
     // "Хром" mode — generic metallic sheen, works with ANY brush the same way rgbShift/glitch do.
-    // Sweep direction follows the stroke's own drawn direction (same strokeAutoAngleDeg already
-    // used by gradient mode) with NO extra rotation, so the repeating highlight/shadow bands are
-    // spaced out ALONG the stroke's length — reading as a reflection traveling down the stroke,
-    // like light sliding along a metal wire, rather than one static gradient across its width.
-    // Band tightness scales with brush size (bigger brush = a few broad bands; thin brush = tighter
-    // banding, same relative look at any scale).
+    // FIX ("просто полосы, никакого металла"): direction used to come from strokeAutoAngleDeg —
+    // just the straight chord between the stroke's first and last point — so on anything but a
+    // dead-straight stroke the sweep pointed the wrong way entirely, and the band wavelength was
+    // tied only to brush thickness, so a long stroke packed in many tight repeating stripes (a
+    // barber pole) instead of one traveling reflection. Now: strokeFlowVector sums the actual
+    // path's own segment vectors (follows real movement, not the chord), and the wavelength is
+    // stretched to a healthy fraction of the stroke's OWN travelled length, so only one or two
+    // broad bands sweep along it — reading as a highlight sliding down the stroke as you drew it,
+    // not a tiled stripe pattern.
     const chromeSet = s.mode === "chrome";
     if (chromeSet) {
-      const angleRad = (strokeAutoAngleDeg(pts) * Math.PI) / 180;
-      target.chromeCos = Math.cos(angleRad);
-      target.chromeSin = Math.sin(angleRad);
-      target.chromeFreq = (2 * Math.PI) / Math.max(20, s.size * 3);
-      // Travels slowly over time so the highlight visibly sweeps across the shape — a living
+      const flow = strokeFlowVector(pts);
+      target.chromeCos = flow.cos;
+      target.chromeSin = flow.sin;
+      target.chromeFreq = (2 * Math.PI) / Math.max(s.size * 6, flow.len * 0.55, 40);
+      // Travels slowly over time so the highlight visibly sweeps along the stroke — a living
       // reflection, not a static gradient — at the same adjustable "Скорость режима" rate every
       // other mode-speed-driven effect (pulse/glitch/rgbShift) already uses.
       target.chromePhase = mt * (0.4 + ms * 1.5);
@@ -1905,6 +1939,18 @@ function IndexInner() {
                 paint(target, Math.round(px / grid + gridPhaseX) * grid, Math.round(py / grid + gridPhaseY) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
               }
             }
+          }
+          // OWN CHARACTER, restored: a small chance per slice of a single bright "corruption
+          // spark" — a near-white, high-contrast cell landing somewhere along the slice, on top
+          // of the normal colored cells above. This is what used to make the brush read as a
+          // distinct "glitch" signature rather than just colored noise — and it survives whatever
+          // MODE is active (still goes through paint(), so "Глитч"/"RGB сдвиг"/"Хром" still apply
+          // to it too) without depending on any one mode to supply it.
+          if (Math.random() < 0.12 + s.intensity * 0.2) {
+            const sparkOff = Math.floor(Math.random() * (widthLine / grid)) * grid;
+            const px = startX + tx * sparkOff, py = startY + ty * sparkOff;
+            const sparkL = 85 + Math.random() * 15;
+            paint(target, Math.round(px / grid + gridPhaseX) * grid, Math.round(py / grid + gridPhaseY) * grid, grid, grid, hueG, 20, sparkL, alphaMul * 0.9);
           }
         }
       }
