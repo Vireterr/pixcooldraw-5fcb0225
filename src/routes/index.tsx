@@ -334,19 +334,20 @@ interface PaintTarget {
   // actually reads as glitch. This used to be baked into just the pixelGlitch brush; now every
   // brush that calls paint() gets it automatically when this mode is selected.
   glitchSplit?: number;
-  // Set for the duration of one stroke's render pass when its MODE is "Хром" — same generic
-  // per-paint-call pattern as spray/rgbShift/glitchSplit above. Simulates a metallic sheen: a
-  // traveling bright/dark band (a sine wave projected along the stroke's own WIDTH axis, i.e. its
-  // normal — not its direction of travel) drains saturation toward silver and pushes lightness
-  // toward the band's highlight/shadow extremes, independent of whichever hue the brush/mode would
-  // otherwise have painted. Projecting on the normal (rather than the tangent) is what makes this
-  // one continuous glint running the FULL LENGTH of the stroke instead of a rainbow-style set of
-  // stripes ruled across it. chromeFreq being unset/0 means the mode is off — checked instead of a
-  // separate boolean so there's only one thing to clear in the cleanup below.
+  // Set for the duration of one stroke's render pass when its MODE is "Хром". REWORKED from a
+  // periodic sine band to a single smooth, non-repeating highlight — the old sine wave, however
+  // it was projected, tiled every `chromeFreq` pixels, and that repetition is exactly what read
+  // as a "grid"/moiré once it crossed grid-aligned brushes (Дизеринг/Мозаика) or just its own
+  // paint()-block quantization. A moving Gaussian blob has no period at all, so there's nothing
+  // left to tile: chromeCenter is this stroke's own centerline (in the same normal-axis
+  // projection as before), chromeSigma is the blob's width (tied to brush size, not a wavelength),
+  // and chromeHighlightPos is how far the blob currently sits off that centerline as it sweeps
+  // back and forth — one soft glint gliding across the stroke's width, never repeating.
   chromeCos?: number;
   chromeSin?: number;
-  chromeFreq?: number;
-  chromePhase?: number;
+  chromeCenter?: number;
+  chromeSigma?: number;
+  chromeHighlightPos?: number;
   // 0..1 — how much the "Хром" sheen's hue rotates as it sweeps (see paint()'s chrome branch).
   // Driven by the stroke's own "Шум" slider; 0 = plain single-hue metal.
   chromeColorAmt?: number;
@@ -525,36 +526,40 @@ function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: 
   }
   // Generic "Хром" mode: recolor toward a metallic sheen BEFORE the real color is computed —
   // unlike spray/glitchSplit/rgbShift above, this doesn't fork into multiple paint calls, it just
-  // reshapes h/s/l for the one call about to happen. `band` is a plain sine of a spatial
-  // projection — always a real -1..1 swing, so the highlight/shadow range can never collapse to a
-  // single flat value the way an accumulated multi-term threshold could (see the pixelDither
-  // rewrite for why that failure mode matters).
-  // REWORKED: this used to slam saturation down to a flat ~25% regardless of the picked hue, so
-  // changing "Оттенок" barely changed anything — every color looked like the same generic silver.
-  // Real metal doesn't desaturate uniformly — it goes WHITE at the highlight (where the light
-  // source reflects straight back) and shows its true, richly saturated color in the shadow. So
-  // `band` now drives lightness AND saturation together: toward the highlight (`hi`) lightness
-  // rises toward white and saturation drops (a blown-out reflection); toward the shadow (`lo`)
-  // lightness falls and saturation RISES above the base (the picked color reads at its deepest and
-  // most vivid there) — anchored on whatever hue was actually picked, copper stays copper, blue
-  // steel stays blue. "Шум" now only adds a small, tight hue drift (±25°, not the old ±70°) for a
-  // bit of iridescence at the edges of that same color — enough to feel alive without drifting
-  // into an unrelated hue that fights the color you chose.
-  if (target.chromeFreq) {
-    const proj = (x * (target.chromeCos ?? 1) + y * (target.chromeSin ?? 0)) * target.chromeFreq + (target.chromePhase ?? 0);
-    const raw = Math.sin(proj); // -1..1
-    // FIX ("никакого эффекта металла"): a plain sine gives two equal-width bands — bright half,
-    // dark half — which reads as flat striping, not a reflection. Real specular highlights are
-    // narrow and sharp; the surrounding shadow is broad and gentle. Power-curving the highlight
-    // side (steep falloff) against a gentler curve on the shadow side turns the same wave into a
-    // thin bright glint traveling over a broad darker metal base — an actual sheen, not a stripe.
-    const hi = Math.pow(Math.max(0, raw), 3);   // narrow, sharp highlight
-    const lo = Math.pow(Math.max(0, -raw), 1.3); // broad, soft shadow
+  // reshapes h/s/l for the one call about to happen.
+  // REWORKED FROM SCRATCH ("сетка/муар, некрасиво"): the old version drove the sheen off a
+  // periodic sine wave — however it was projected, a sine repeats every `chromeFreq` pixels, and
+  // that repetition is exactly what tiled into a visible grid once it crossed the brush's own
+  // grid-quantized paint blocks (worst on Дизеринг/Мозаика, but visible everywhere at high
+  // density). A moving GAUSSIAN blob instead of a wave has no period — nothing to tile — so it
+  // reads as one soft, continuous glint gliding across the stroke, the way light actually slides
+  // over a polished metal surface, never as a repeating pattern.
+  // `rel` is this pixel's distance from the blob's current center (chromeCenter, the stroke's own
+  // width-axis centerline, plus chromeHighlightPos, how far the blob has currently swept off it).
+  // `band` is a smooth 0..1 bell curve of that distance — no hard edges, no steps, just a soft
+  // falloff, so there is nothing left in the math that could ever look "gridded".
+  if (target.chromeSigma) {
+    const proj = x * (target.chromeCos ?? 1) + y * (target.chromeSin ?? 0);
+    const rel = proj - (target.chromeCenter ?? 0) - (target.chromeHighlightPos ?? 0);
+    const sigma = target.chromeSigma;
+    const band = Math.exp(-(rel * rel) / (2 * sigma * sigma)); // 0..1, smooth, non-periodic
+    // A second, dimmer counter-glint on the opposite side of center gives the surface a bit of
+    // roundness (like a curved rod catching a secondary reflection) instead of one lone dot of
+    // light on an otherwise flat plane — still a plain Gaussian, still nothing periodic.
+    const rel2 = proj - (target.chromeCenter ?? 0) + (target.chromeHighlightPos ?? 0) * 0.55;
+    const sigma2 = sigma * 1.7;
+    const band2 = Math.exp(-(rel2 * rel2) / (2 * sigma2 * sigma2)) * 0.4;
+    const lit = Math.max(band, band2);
     const colorAmt = target.chromeColorAmt ?? 0;
-    const colorBand = Math.sin(proj * 1.7 + 2.1);
-    h = h + colorBand * 25 * colorAmt;
-    l = Math.max(4, Math.min(97, l * 0.35 + 45 + hi * 55 - lo * 28));
-    s = Math.max(0, Math.min(100, s * (0.65 + lo * 0.5 - hi * 0.5)));
+    // Gentle hue drift across the SAME soft bell curve (not a separate periodic wave) — a faint
+    // warm/cool iridescence right where the light itself is, instead of an unrelated hue ripple
+    // running independently across the surface.
+    h = h + (band - band2) * 22 * colorAmt;
+    // Toward the glint: lightness rises toward a blown-out highlight, saturation drops (a real
+    // reflection washes color out). Away from it: the picked hue reads at its own base tone,
+    // slightly deepened — copper stays copper, blue steel stays blue, never a flat generic silver.
+    l = Math.max(4, Math.min(97, l * (0.55 + lit * 0.5) + lit * 40));
+    s = Math.max(0, Math.min(100, s * (0.55 + (1 - lit) * 0.45)));
   }
   const [r, g, b] = getHslRgb(h, s, l);
   // Generic "Глитч" mode: paint the SAME call three times, tinted 0°/+120°/+240° off the real
@@ -1688,15 +1693,26 @@ function IndexInner() {
     const chromeSet = s.mode === "chrome";
     if (chromeSet) {
       const flow = strokeFlowVector(pts);
-      // Rotate the flow direction 90° to get the stroke's own width axis (normal).
-      target.chromeCos = -flow.sin;
-      target.chromeSin = flow.cos;
-      target.chromeFreq = (2 * Math.PI) / Math.max(s.size * 1.6, 24);
-      // The highlight still lives, but now it sweeps ACROSS the stroke's width — as though the
-      // light source (or the viewer) is moving side to side over the metal — instead of crawling
-      // down the stroke's length the way a rainbow flow would. Same adjustable "Скорость режима"
-      // rate every other mode-speed-driven effect (pulse/glitch/rgbShift) already uses.
-      target.chromePhase = mt * (0.4 + ms * 1.5);
+      // Stroke's own width axis (normal to its direction of travel) — same axis as before, just
+      // no longer fed into a periodic wave.
+      const nx = -flow.sin, ny = flow.cos;
+      target.chromeCos = nx;
+      target.chromeSin = ny;
+      // This stroke's own centerline in that projection (average across its points), so the
+      // highlight is anchored to THIS stroke instead of an arbitrary world-space origin.
+      let sumProj = 0;
+      for (let i = 0; i < pts.length; i++) sumProj += pts[i].x * nx + pts[i].y * ny;
+      target.chromeCenter = pts.length ? sumProj / pts.length : 0;
+      // Blob width tracks brush size directly (not a wavelength) — one soft glint roughly as wide
+      // as the brush itself, not a repeating pattern at any scale.
+      target.chromeSigma = Math.max(6, s.size * 0.4);
+      // The highlight sweeps back and forth across the stroke's own width — a real reflection
+      // gliding over the metal — at the same adjustable "Скорость режима" rate every other
+      // mode-speed-driven effect (pulse/glitch/rgbShift) already uses. Because this is a single
+      // moving blob (not a periodic wave), the sweep never tiles into repeats no matter how far
+      // chromeHighlightPos travels.
+      const sweepRange = s.size * 1.3;
+      target.chromeHighlightPos = Math.sin(mt * (0.35 + ms * 1.2)) * sweepRange;
       target.chromeColorAmt = s.noise;
     }
 
@@ -1881,39 +1897,62 @@ function IndexInner() {
     }
 
     else if (s.kind === "pixelGlitch") {
+      // With just one point (right after pointer-down, before any movement), the full slice
+      // pattern was still drawn stacked around that single spot — there's no real direction yet,
+      // and this is exactly what read as a stray dot sitting at the very start of every stroke,
+      // separate from the actual glitch that appears once you start dragging. Wait for at least
+      // one real segment before drawing anything.
+      if (pts.length < 2) return;
       const grid = Math.max(2, Math.round(s.size / 6));
       const stepPts = Math.max(1, Math.floor(pts.length / 30));
+      // dynamics doubles as "how much this brush follows the stroke's own direction": 0 keeps the
+      // slices in the fixed horizontal pose (nx=0,ny=1), increasing values blend smoothly toward
+      // fully following the local path direction.
+      const segs = getSegCache(s, pts, grid);
       for (let pi = 0; pi < pts.length; pi += stepPts) {
         const p = pts[pi];
         const hueG = hueAt(pi);
         const radius = s.size * (0.8 + s.dynamics * 1.5);
         const slices = 3 + Math.floor(s.density * 8);
+        const seg = segs[Math.min(pi, segs.length - 1)];
+        const followT = Math.max(0, Math.min(1, s.dynamics));
+        const nx0 = 0, ny0 = 1; // static pose: bars stack vertically, extend horizontally
+        const nx1 = seg ? seg.nx : nx0, ny1 = seg ? seg.ny : ny0;
+        let nx = nx0 * (1 - followT) + nx1 * followT;
+        let ny = ny0 * (1 - followT) + ny1 * followT;
+        const nlen = Math.hypot(nx, ny) || 1;
+        nx /= nlen; ny /= nlen;
+        const tx = ny, ty = -nx; // tangent = normal rotated 90°
         for (let i = 0; i < slices; i++) {
           const yOff = (i / slices - 0.5) * radius * 2;
           const shift = (hash(Math.floor(tt * 8) + i + p.t) * 2) * s.size * (0.3 + s.noise * 2);
           const widthLine = radius * 2 * (0.6 + Math.random() * 0.4);
-          const x0 = p.x - widthLine / 2 + shift;
-          const y0 = Math.round((p.y + yOff) / grid) * grid;
-          const offs = [-grid, 0, grid];
-          let hues: number[];
-          if (s.mode === "gradient") {
-            // Sample the actual chosen palette at three nearby positions instead of a synthetic
-            // +120/+240 hue offset — otherwise the channel-split always looks like a generic RGB
-            // trio no matter which colors were picked, making the tool feel unresponsive to them.
-            const spread = 0.035;
-            const basePos = (p.x * gradCos + p.y * gradSin) / gradExtent + gradTravel;
-            hues = [
-              sampleGradient(s.gradientColors, basePos - spread),
-              sampleGradient(s.gradientColors, basePos),
-              sampleGradient(s.gradientColors, basePos + spread),
-            ];
-          } else {
-            hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
-          }
-          for (let c2 = 0; c2 < 3; c2++) {
+          const baseX = p.x + nx * yOff, baseY = p.y + ny * yOff;
+          const startX = baseX - tx * (widthLine / 2) + tx * shift;
+          const startY = baseY - ty * (widthLine / 2) + ty * shift;
+          // Color lives in the "Глитч"/"RGB сдвиг" MODES (target.glitchSplit/target.rgbShift in
+          // paint()) — this brush only shapes the slices (position/width/count/density), the same
+          // way every other brush does, and calls plain paint() so it reacts to whichever mode is
+          // active. In "Глитч" mode paint() ALREADY triples every call into three offset+tinted
+          // copies on its own (target.glitchSplit) — stacking that on top of this brush's own
+          // triple pass would compound into 9 small scattered blocks per step instead of 3. So:
+          // skip this brush's own tripling specifically when "Глитч" is active, keep it for every
+          // other mode (where paint() does nothing extra on its own).
+          if (glitchOn) {
             for (let xb = 0; xb < widthLine; xb += grid) {
               if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-              paint(target, Math.round((x0 + xb + offs[c2]) / grid) * grid, y0, grid, grid, hues[c2], 100, 55, alphaMul * 0.55);
+              const px = startX + tx * xb, py = startY + ty * xb;
+              paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+            }
+          } else {
+            const offs = [-grid, 0, grid];
+            for (let c2 = 0; c2 < 3; c2++) {
+              for (let xb = 0; xb < widthLine; xb += grid) {
+                if (Math.random() > 0.4 + s.intensity * 0.5) continue;
+                const off = xb + offs[c2];
+                const px = startX + tx * off, py = startY + ty * off;
+                paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+              }
             }
           }
         }
@@ -2046,7 +2085,7 @@ function IndexInner() {
       if (spraySet) { target.spray = undefined; target.sprayKeep = undefined; }
       if (rgbShiftSet) { target.rgbShift = undefined; }
       if (glitchSplitSet) { target.glitchSplit = undefined; }
-      if (chromeSet) { target.chromeFreq = undefined; target.chromeCos = undefined; target.chromeSin = undefined; target.chromePhase = undefined; target.chromeColorAmt = undefined; }
+      if (chromeSet) { target.chromeSigma = undefined; target.chromeCos = undefined; target.chromeSin = undefined; target.chromeCenter = undefined; target.chromeHighlightPos = undefined; target.chromeColorAmt = undefined; }
     }
   }
 
@@ -3121,13 +3160,29 @@ function IndexInner() {
             <span className="mb-1 flex justify-between"><span>Размер</span><span className="text-white/80">{size}</span></span>
             <input type="range" min={4} max={120} value={size} onChange={(e) => setSize(+e.target.value)} className="w-full accent-white" />
           </label>
-          <label className="block text-[10px] uppercase tracking-widest text-white/50">
+          <div className="block text-[10px] uppercase tracking-widest text-white/50">
             <span className="mb-1 flex items-center justify-between">
               <span>Цвет</span>
-              <span className="h-4 w-4 rounded-full border border-white/30" style={{ backgroundColor: `hsl(${hue}, 90%, 60%)` }} />
+              {/* Кликабельный ярлычок цвета: под кружком реального размера лежит настоящий
+                  <input type="color"> (растянут на всю площадь через absolute+inset-0, просто
+                  невидим), так что клик открывает нативную палитру браузера (цвет/оттенок/
+                  насыщенность/HEX и т.д.). Раньше инпут был схлопнут в 0×0 — в части браузеров
+                  такой инпут не открывает палитру по клику на обёртку, даже если это <label>. */}
+              <span className="relative h-4 w-4 shrink-0" title="Открыть палитру">
+                <span
+                  className="pointer-events-none absolute inset-0 rounded-full border border-white/30"
+                  style={{ backgroundColor: `hsl(${hue}, 90%, 60%)` }}
+                />
+                <input
+                  type="color"
+                  value={hueToHex(hue)}
+                  onChange={(e) => setHue(hexToHue(e.target.value))}
+                  className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                />
+              </span>
             </span>
             <input type="range" min={0} max={360} value={hue} onChange={(e) => setHue(+e.target.value)} className="w-full" style={{ background: "linear-gradient(to right, hsl(0,90%,60%), hsl(60,90%,60%), hsl(120,90%,60%), hsl(180,90%,60%), hsl(240,90%,60%), hsl(300,90%,60%), hsl(360,90%,60%))", appearance: "none", height: 6, borderRadius: 999 }} />
-          </label>
+          </div>
         </section>
 
         {/* Params */}
