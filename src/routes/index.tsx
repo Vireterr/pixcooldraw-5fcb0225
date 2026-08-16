@@ -26,7 +26,8 @@ type BrushKind =
   | "embers"
   | "fill"
   | "eraser"
-  | "eyedropper";
+  | "eyedropper"
+  | "text";
 
 type ModeKind = "normal" | "rainbow" | "gradient" | "pulse" | "spray" | "mirror" | "glitch" | "rgbShift" | "chrome";
 
@@ -798,6 +799,130 @@ function strokeFlowVector(pts: StrokePoint[]): { cos: number; sin: number; len: 
 let strokeIdCounter = 0;
 let layerIdCounter = 0;
 
+// ==== Text tool: font -> closed pixel contours (Moore-Neighbor square tracing) ====
+// Traces every closed boundary in a binary mask — BOTH each shape's outer silhouette AND every
+// enclosed hole inside it (a letter's counter, like the inside of "O"/"Р"/"Ф"/"8") — as separate
+// closed polygons in pixel-grid coordinates. This is what lets a traced letter later be handed to
+// ANY existing brush (ink/ribbon/lightning/...) as a normal closed Stroke and have it come out
+// looking like a real hollow letter instead of a solid blob: the hole's boundary is its own
+// contour, so a brush drawn along it reads as the letter's inner edge, not filled-in.
+// Algorithm: classic raster-scan + Moore-Neighbor boundary following (the same approach OpenCV's
+// findContours uses under the hood, minus the outer/hole parent-child hierarchy, which nothing
+// here needs — every contour is rendered as its own independent Stroke either way). Verified
+// against synthetic test masks (a ring/annulus, multiple disjoint blobs) before wiring in: outer
+// silhouette and hole boundaries both come back as separate, correctly closed loops.
+function traceAllContours(mask: Uint8Array, w: number, h: number): { x: number; y: number }[][] {
+  const visited = new Uint8Array(w * h);
+  const at = (x: number, y: number) => (x < 0 || y < 0 || x >= w || y >= h) ? 0 : mask[y * w + x];
+  // 8 neighbor offsets, clockwise, starting West — standard Moore-tracing convention.
+  const DX = [-1, -1, 0, 1, 1, 1, 0, -1];
+  const DY = [0, -1, -1, -1, 0, 1, 1, 1];
+
+  function traceOne(sx: number, sy: number): { x: number; y: number }[] {
+    const contour = [{ x: sx, y: sy }];
+    let cx = sx, cy = sy;
+    // Arrived here with the West neighbor confirmed background (see the caller's start
+    // condition), so the initial backtrack direction is West (index 0).
+    let backtrack = 0;
+    const first = { x: sx, y: sy };
+    let firstDir = -1;
+    let steps = 0;
+    const maxSteps = w * h * 8 + 8;
+    while (steps++ < maxSteps) {
+      let found = false, foundDir = -1;
+      for (let k = 1; k <= 8; k++) {
+        const d = (backtrack + k) % 8;
+        const nx = cx + DX[d], ny = cy + DY[d];
+        if (at(nx, ny)) { found = true; foundDir = d; cx = nx; cy = ny; break; }
+      }
+      if (!found) break; // isolated single pixel — nothing more to trace
+      backtrack = (foundDir + 4) % 8;
+      if (cx === first.x && cy === first.y) {
+        // Loop closure check: same start pixel AND same arrival direction as the very first
+        // arrival there means we've gone all the way around, not just passed through once.
+        if (firstDir === -1) firstDir = foundDir;
+        else if (foundDir === firstDir) break;
+      } else {
+        contour.push({ x: cx, y: cy });
+      }
+      if (contour.length > w * h) break; // safety valve against a malformed mask
+    }
+    return contour;
+  }
+
+  const contours: { x: number; y: number }[][] = [];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (!at(x, y) || visited[y * w + x]) continue;
+      // Border-start condition (catches BOTH a shape's outer silhouette and every hole's inner
+      // boundary automatically, with no separate hole-detection pass needed): a foreground pixel
+      // whose immediate West neighbor is background, not yet claimed by an earlier trace.
+      if (!at(x - 1, y)) {
+        const c = traceOne(x, y);
+        for (const p of c) visited[p.y * w + p.x] = 1;
+        if (c.length >= 6) contours.push(c); // drop degenerate specks (font hinting artifacts etc.)
+      }
+    }
+  }
+  return contours;
+}
+
+// Renders one line of text (a single font, size, weight) into a tightly-cropped offscreen canvas
+// and returns its alpha mask plus the pixel offset needed to place mask-local coordinates back
+// onto the real canvas at the point the user clicked. Multi-line input is handled by the caller,
+// one call per line, stacked by its own measured line height.
+function rasterizeTextLine(text: string, font: string, sizePx: number, bold: boolean): { mask: Uint8Array; w: number; h: number; ascent: number } | null {
+  if (!text.trim()) return null;
+  const measure = document.createElement("canvas").getContext("2d")!;
+  const fontStr = `${bold ? "bold " : ""}${sizePx}px "${font}"`;
+  measure.font = fontStr;
+  const m = measure.measureText(text);
+  const ascent = m.actualBoundingBoxAscent ?? sizePx * 0.8;
+  const descent = m.actualBoundingBoxDescent ?? sizePx * 0.25;
+  const width = Math.max(1, Math.ceil(m.width) + 4);
+  const height = Math.max(1, Math.ceil(ascent + descent) + 4);
+  const off = document.createElement("canvas");
+  off.width = width; off.height = height;
+  const octx = off.getContext("2d")!;
+  octx.font = fontStr;
+  octx.fillStyle = "#fff";
+  octx.textBaseline = "alphabetic";
+  octx.fillText(text, 2, ascent + 2);
+  const { data } = octx.getImageData(0, 0, width, height);
+  const mask = new Uint8Array(width * height);
+  for (let i = 0, p = 3; i < mask.length; i++, p += 4) mask[i] = data[p] > 96 ? 1 : 0;
+  return { mask, w: width, h: height, ascent };
+}
+
+// Turns one traced contour (pixel-grid points, tight spacing — one point per boundary pixel step)
+// into a real Stroke path: world-space offset applied, then decimated down to a natural point
+// density (a raw per-pixel contour on a 120px-tall letter can be several hundred points — far
+// denser than anything a hand-drawn stroke would ever produce, and every brush's per-point cost
+// scales with count) while keeping the loop closed (first point repeated at the end) so brushes
+// that draw segment-by-segment wrap all the way around instead of leaving the loop open.
+function contourToStrokePoints(contour: { x: number; y: number }[], offsetX: number, offsetY: number, scale: number): StrokePoint[] {
+  const targetCount = 110;
+  const step = Math.max(1, Math.floor(contour.length / targetCount));
+  const pts: StrokePoint[] = [];
+  for (let i = 0; i < contour.length; i += step) {
+    pts.push({ x: contour[i].x * scale + offsetX, y: contour[i].y * scale + offsetY, t: 0 });
+  }
+  // Close the loop explicitly.
+  const c0 = contour[0];
+  pts.push({ x: c0.x * scale + offsetX, y: c0.y * scale + offsetY, t: 0 });
+  // t values spaced by cumulative travelled distance (0..1) — matches how a real drawn stroke's
+  // t/time progresses along its own length, which some brushes (ribbon's wave phase) read from.
+  let total = 0;
+  const dists: number[] = [0];
+  for (let i = 1; i < pts.length; i++) {
+    total += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+    dists.push(total);
+  }
+  for (let i = 0; i < pts.length; i++) pts[i].t = total > 0 ? dists[i] / total : 0;
+  return pts;
+}
+
+
 // PERF: history used to re-JSON.stringify EVERY stroke's full point list on EVERY pushHistory()
 // call, even for strokes that hadn't changed since the last snapshot — cost grew with the whole
 // picture's total data, not with what was actually drawn since the last undo step. This cache
@@ -1049,6 +1174,17 @@ function IndexInner() {
   // the max per-channel color difference (0-255) still counted as "the same color".
   const [fillContiguous, setFillContiguous] = useState(true);
   const [fillTolerance, setFillTolerance] = useState(32);
+  // "Текст" tool: rasterizes the typed string into letter contours (see traceAllContours above),
+  // then stamps them as real Strokes using whichever brush is picked here (textBrush) — so every
+  // existing brush/mode effect applies to text the same way it applies to a hand-drawn line,
+  // without any brush-specific code for text at all. textBrush stays independent from the main
+  // "brush" selector (which is pinned to "text" while this tool is active) so switching back to
+  // drawing doesn't lose which letter-brush was chosen.
+  const [textValue, setTextValue] = useState("Привет");
+  const [textFont, setTextFont] = useState("Arial");
+  const [textSize, setTextSize] = useState(72);
+  const [textBold, setTextBold] = useState(true);
+  const [textBrush, setTextBrush] = useState<BrushKind>("ink");
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
@@ -1230,6 +1366,11 @@ function IndexInner() {
     animEnabled: useRef(animEnabled),
     fillContiguous: useRef(fillContiguous),
     fillTolerance: useRef(fillTolerance),
+    textValue: useRef(textValue),
+    textFont: useRef(textFont),
+    textSize: useRef(textSize),
+    textBold: useRef(textBold),
+    textBrush: useRef(textBrush),
   };
   useEffect(() => { refs.brush.current = brush; });
   useEffect(() => { refs.mode.current = mode; });
@@ -1254,6 +1395,11 @@ function IndexInner() {
   useEffect(() => { refs.animEnabled.current = animEnabled; });
   useEffect(() => { refs.fillContiguous.current = fillContiguous; });
   useEffect(() => { refs.fillTolerance.current = fillTolerance; });
+  useEffect(() => { refs.textValue.current = textValue; });
+  useEffect(() => { refs.textFont.current = textFont; });
+  useEffect(() => { refs.textSize.current = textSize; });
+  useEffect(() => { refs.textBold.current = textBold; });
+  useEffect(() => { refs.textBrush.current = textBrush; });
 
   // Create the Pixi Application — and with it, the ONE WebGL context it owns — exactly once for
   // this component's lifetime, NOT per canvasSize change. Recreating the whole Application (a brand
@@ -2352,6 +2498,116 @@ function IndexInner() {
       return;
     }
 
+    if (refs.brush.current === "text") {
+      // One click stamps the whole typed block, same "single commit, not a drag" pattern as
+      // Заливка/Пипетка above.
+      pointerRef.current.down = false;
+      const layerT = layersRef.current.find(l => l.id === activeLayerIdRef.current);
+      if (!layerT || !layerT.visible) return;
+      const raw = refs.textValue.current;
+      if (!raw || !raw.trim()) return;
+      const lines = raw.split("\n");
+      const rasters = lines.map(line => rasterizeTextLine(line, refs.textFont.current, refs.textSize.current, refs.textBold.current));
+      const lineGap = Math.round(refs.textSize.current * 0.18);
+      let totalH = 0;
+      let maxW = 0;
+      for (const r of rasters) {
+        if (!r) continue;
+        totalH += r.h;
+        if (r.w > maxW) maxW = r.w;
+      }
+      totalH += lineGap * Math.max(0, rasters.filter(Boolean).length - 1);
+      if (totalH <= 0 || maxW <= 0) return; // nothing but blank/whitespace lines
+
+      const w = canvasSize.w, h = canvasSize.h;
+      const commonFields = {
+        mode: refs.mode.current,
+        size: refs.size.current,
+        hue: refs.hue.current,
+        speed: refs.speed.current,
+        density: refs.density.current,
+        noise: refs.noise.current,
+        intensity: refs.intensity.current,
+        dynamics: refs.dynamics.current,
+        modeSpeed: refs.modeSpeed.current,
+        pulseOn: refs.pulseOn.current,
+        mirrorOn: refs.mirrorOn.current,
+        sprayOn: refs.sprayOn.current,
+        rainbowFlow: refs.rainbowFlow.current,
+        rainbowFlowSpeed: refs.rainbowFlowSpeed.current,
+        rainbowBlinkSpeed: refs.rainbowBlinkSpeed.current,
+        gradientSpeed: refs.gradientSpeed.current,
+        gradientScale: refs.gradientScale.current,
+        gradientColors: refs.gradientColors.current.map(c => ({ ...c })),
+        gradientAngle: refs.gradientAngle.current,
+        frozen: !refs.animEnabled.current,
+      };
+
+      // "Заливка" chosen as the letter-brush: build ONE solid mask covering every line's letter
+      // pixels (placed/centered on the click point) and commit it exactly like a normal bucket
+      // fill — reuses the fill renderer as-is, no text-specific rendering code needed for it.
+      if (refs.textBrush.current === "fill") {
+        const combined = new Uint8Array(w * h);
+        let cy = y - totalH / 2;
+        for (const r of rasters) {
+          if (!r) continue;
+          const ox = Math.round(x - r.w / 2), oy = Math.round(cy);
+          for (let py = 0; py < r.h; py++) {
+            const wy = oy + py;
+            if (wy < 0 || wy >= h) continue;
+            for (let px = 0; px < r.w; px++) {
+              if (!r.mask[py * r.w + px]) continue;
+              const wx = ox + px;
+              if (wx < 0 || wx >= w) continue;
+              combined[wy * w + wx] = 1;
+            }
+          }
+          cy += r.h + lineGap;
+        }
+        const textFillStroke: Stroke = {
+          id: ++strokeIdCounter,
+          kind: "fill",
+          ...commonFields,
+          points: [{ x: Math.round(x), y: Math.round(y), t: 0 }],
+          born: performance.now(),
+          fillRuns: encodeMaskRLE(combined),
+          fillW: w,
+          fillH: h,
+        };
+        layerT.strokes.push(textFillStroke);
+        pushHistory();
+        return;
+      }
+
+      // Every other brush: each traced contour (a letter's outer silhouette, or one of its
+      // holes) becomes its OWN Stroke, using the currently picked "letter brush" — a separate
+      // Stroke per closed loop is what keeps disjoint letters (and holes) from being connected
+      // by a stray line the way one shared point list would.
+      const newStrokes: Stroke[] = [];
+      let cy = y - totalH / 2;
+      for (const r of rasters) {
+        if (!r) continue;
+        const ox = x - r.w / 2, oy = cy;
+        const contours = traceAllContours(r.mask, r.w, r.h);
+        for (const c of contours) {
+          const pts = contourToStrokePoints(c, ox, oy, 1);
+          if (pts.length < 2) continue;
+          newStrokes.push({
+            id: ++strokeIdCounter,
+            kind: refs.textBrush.current,
+            ...commonFields,
+            points: pts,
+            born: performance.now(),
+          });
+        }
+        cy += r.h + lineGap;
+      }
+      if (newStrokes.length === 0) return;
+      for (const st of newStrokes) layerT.strokes.push(st);
+      pushHistory();
+      return;
+    }
+
     const layer = layersRef.current.find(l => l.id === activeLayerIdRef.current);
     if (!layer || !layer.visible) return;
     const stroke: Stroke = {
@@ -3003,6 +3259,75 @@ function IndexInner() {
             </div>
           </section>
         )}
+
+        {/* Text — a fully separate, standalone section (own header, own activation button),
+            deliberately not merged into "Инструмент" or "Кисть": rasterizes the typed string,
+            traces its letter contours (including inner "holes" — О/Р/Ф etc.), then stamps each
+            contour as an ordinary Stroke using whichever brush is picked below — so any brush/mode
+            effect works on text the same way it works on a hand-drawn line, no text-specific
+            render code needed for it. */}
+        <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
+          <div className="mb-1.5 text-[9px] uppercase tracking-widest text-white/40">Текст</div>
+          <button
+            onClick={() => { setSelectTool(false); setSelectedIds(new Set()); setMarquee(null); setBrush("text"); }}
+            className={`w-full rounded border px-2 py-1.5 text-[11px] tracking-wider transition ${brush === "text" ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/60 hover:bg-white/[0.06]"}`}
+          >
+            {brush === "text" ? "Инструмент «Текст» активен" : "Включить инструмент «Текст»"}
+          </button>
+          {brush === "text" && (
+            <>
+              <textarea
+                value={textValue}
+                onChange={(e) => setTextValue(e.target.value)}
+                rows={2}
+                placeholder="Введите текст…"
+                className="w-full resize-none rounded border border-white/10 bg-black/40 px-2 py-1.5 text-[12px] text-white placeholder:text-white/30"
+              />
+              <div className="flex gap-1.5">
+                <select
+                  value={textFont}
+                  onChange={(e) => setTextFont(e.target.value)}
+                  className="w-full rounded border border-white/10 bg-black/40 px-1.5 py-1 text-[11px] text-white"
+                >
+                  <option value="Arial">Arial</option>
+                  <option value="Georgia">Georgia</option>
+                  <option value="Times New Roman">Times New Roman</option>
+                  <option value="Courier New">Courier New</option>
+                  <option value="Impact">Impact</option>
+                  <option value="Verdana">Verdana</option>
+                  <option value="Comic Sans MS">Comic Sans MS</option>
+                </select>
+                <button
+                  onClick={() => setTextBold(v => !v)}
+                  className={`shrink-0 rounded border px-2.5 py-1 text-[11px] font-bold transition ${textBold ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/50 hover:bg-white/[0.06]"}`}
+                  title="Жирный"
+                >
+                  Ж
+                </button>
+              </div>
+              <label className="block text-[10px] uppercase tracking-widest text-white/50">
+                <span className="mb-1 flex justify-between"><span>Размер шрифта</span><span className="text-white/80">{textSize}px</span></span>
+                <input type="range" min={16} max={280} value={textSize} onChange={(e) => setTextSize(+e.target.value)} className="w-full accent-white" />
+              </label>
+              <div className="mb-1 text-[9px] uppercase tracking-widest text-white/40">Кисть для букв</div>
+              <div className="grid grid-cols-2 gap-1">
+                {BRUSHES.filter(b => b.id !== "text" && b.id !== "eraser" && b.id !== "eyedropper").map(b => (
+                  <button
+                    key={b.id}
+                    onClick={() => setTextBrush(b.id)}
+                    className={`rounded border px-2 py-1 text-[10px] tracking-wider transition ${textBrush === b.id ? "border-white/60 bg-white/15" : "border-white/10 bg-white/[0.02] text-white/60 hover:bg-white/[0.06]"}`}
+                  >
+                    {b.label}
+                  </button>
+                ))}
+              </div>
+              <div className="text-[8px] normal-case tracking-normal text-white/30">
+                Кликните по холсту, чтобы разместить текст (клик — центр блока). Использует текущий
+                цвет/режим и параметры кисти выше, включая её живую анимацию.
+              </div>
+            </>
+          )}
+        </section>
 
         {/* Modes */}
         <section className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5">
