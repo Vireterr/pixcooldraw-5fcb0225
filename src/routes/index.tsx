@@ -983,41 +983,26 @@ function simplifyDouglasPeucker(pts: { x: number; y: number }[], epsilon: number
   const right = simplifyDouglasPeucker(pts.slice(maxIdx), epsilon);
   return left.slice(0, -1).concat(right);
 }
-// Chaikin corner-cutting smoothing — runs on the ALREADY-simplified handful of contour points
-// (not on pixels), so it costs nothing extra on the canvas: it's what turns the pixel-grid
-// "staircase" a round letter (О/С/Б) traces into on any raster into a genuinely smooth curve,
-// without rendering a single extra pixel to get there. Two passes is enough to read as round
-// without softening real corners away (each pass only pulls 1/4 of the way toward the corner).
-function chaikinSmooth(pts: { x: number; y: number }[], passes: number): { x: number; y: number }[] {
-  let cur = pts;
-  for (let pass = 0; pass < passes; pass++) {
-    if (cur.length < 3) break;
-    const next: { x: number; y: number }[] = [];
-    for (let i = 0; i < cur.length - 1; i++) {
-      const p0 = cur[i], p1 = cur[i + 1];
-      next.push({ x: p0.x * 0.75 + p1.x * 0.25, y: p0.y * 0.75 + p1.y * 0.25 });
-      next.push({ x: p0.x * 0.25 + p1.x * 0.75, y: p0.y * 0.25 + p1.y * 0.75 });
-    }
-    next.push(cur[cur.length - 1]);
-    cur = next;
-  }
-  return cur;
-}
 // Turns one traced contour (pixel-grid points, tight spacing — one point per boundary pixel step)
-// into a real Stroke path: world-space offset applied, then REWORKED from a fixed "every Nth
-// point" stride into Douglas-Peucker simplification (keeps real corners, drops points wasted on
-// already-straight stretches) followed by light Chaikin smoothing (rounds off the pixel-grid
-// "staircase" a curve traces on any raster) — visually closer to the real letterform at the SAME
-// or lower point count, not more: none of this touches pixels or runs per-frame, it's a one-time
-// pass over a few hundred contour points at most, done once when the text is stamped.
+// into a real Stroke path: world-space offset applied, then simplified via Douglas-Peucker (keeps
+// real corners exactly where the traced contour actually bends, drops points wasted on
+// already-straight stretches) — REVERTED the Chaikin corner-cutting smoothing pass that used to
+// run after this ("хуже, не следование шрифтам"): Chaikin rounds off EVERY corner it's given
+// indiscriminately, including genuine sharp right-angle corners real letterforms are full of (top
+// of "П"/"Г"/"Т", the corners of "Ш"/"Н", serifs) — so on actual text it read as letters melting
+// into soft blobs instead of following the font, not as smoothing. Douglas-Peucker alone already
+// keeps the point exactly where the pixel contour bends, which is the correct behavior for both a
+// real corner (keeps it sharp) and a curve (keeps enough points along it to still read as round at
+// this letter size) — no separate smoothing pass is needed or wanted on top of it.
 function contourToStrokePoints(contour: { x: number; y: number }[], offsetX: number, offsetY: number, scale: number): StrokePoint[] {
   // Simplify BEFORE placing in world space — epsilon is in the same pixel-grid units the raw
   // contour is already in, so it doesn't need to track the (currently always 1) scale factor.
-  const simplified = simplifyDouglasPeucker(contour, 1.1);
-  const smoothed = chaikinSmooth(simplified, 2);
-  const pts: StrokePoint[] = smoothed.map(p => ({ x: p.x * scale + offsetX, y: p.y * scale + offsetY, t: 0 }));
+  // Smaller epsilon than before (0.75, was 1.1) — hugs the actual traced shape more closely,
+  // since there's no smoothing pass afterward to paper over an overly aggressive simplification.
+  const simplified = simplifyDouglasPeucker(contour, 0.75);
+  const pts: StrokePoint[] = simplified.map(p => ({ x: p.x * scale + offsetX, y: p.y * scale + offsetY, t: 0 }));
   // Close the loop explicitly.
-  const c0 = smoothed[0];
+  const c0 = simplified[0];
   pts.push({ x: c0.x * scale + offsetX, y: c0.y * scale + offsetY, t: 0 });
   // t values spaced by cumulative travelled distance (0..1) — matches how a real drawn stroke's
   // t/time progresses along its own length, which some brushes (ribbon's wave phase) read from.
@@ -2166,63 +2151,87 @@ function IndexInner() {
       // one real segment before drawing anything.
       if (pts.length < 2) return;
       const grid = Math.max(2, Math.round(s.size / 6));
-      const stepPts = Math.max(1, Math.floor(pts.length / 30));
       // dynamics now doubles as "how much this brush follows the stroke's own direction": 0 keeps
       // the slices in the original fixed horizontal pose (nx=0,ny=1 — same as before direction
       // tracking existed), and increasing values blend smoothly toward fully following the local
       // path direction. So dynamics no longer only controls radius — it's the one knob for both
       // reach and how "aware" the glitch is of the stroke's own movement.
       const segs = getSegCache(s, pts, grid);
-      for (let pi = 0; pi < pts.length; pi += stepPts) {
-        const p = pts[pi];
-        const hueG = hueAt(pi);
-        const radius = s.size * (0.8 + s.dynamics * 1.5);
-        const slices = 3 + Math.floor(s.density * 8);
-        const seg = segs[Math.min(pi, segs.length - 1)];
-        const followT = Math.max(0, Math.min(1, s.dynamics));
-        const nx0 = 0, ny0 = 1; // static pose: bars stack vertically, extend horizontally
-        const nx1 = seg ? seg.nx : nx0, ny1 = seg ? seg.ny : ny0;
-        let nx = nx0 * (1 - followT) + nx1 * followT;
-        let ny = ny0 * (1 - followT) + ny1 * followT;
-        const nlen = Math.hypot(nx, ny) || 1;
-        nx /= nlen; ny /= nlen;
-        const tx = ny, ty = -nx; // tangent = normal rotated 90°
-        for (let i = 0; i < slices; i++) {
-          const yOff = (i / slices - 0.5) * radius * 2;
-          const shift = (hash(Math.floor(tt * 8) + i + p.t) * 2) * s.size * (0.3 + s.noise * 2);
-          const widthLine = radius * 2 * (0.6 + Math.random() * 0.4);
-          const baseX = p.x + nx * yOff, baseY = p.y + ny * yOff;
-          const startX = baseX - tx * (widthLine / 2) + tx * shift;
-          const startY = baseY - ty * (widthLine / 2) + ty * shift;
-          // Per feedback: color moved OUT of this brush entirely and into the "Глитч" MODE (see
-          // target.glitchSplit in paint()/renderStroke) — this brush only shapes the slices now
-          // (position/width/count/density), exactly like every other brush. The triple pass at
-          // [-grid,0,grid] is shape/density (three interleaved offset copies per slice — dropping
-          // it read as too smooth, see earlier fix), NOT color. BUT: in "Глитч" mode specifically,
-          // paint() ALREADY triples every single call into three offset+tinted copies on its own
-          // (target.glitchSplit) — stacking that on top of this brush's own triple pass compounded
-          // into 9 small scattered blocks per step instead of 3, which is exactly what read as
-          // faded/washed out (same total ink spread over 3x the positions). So: skip this brush's
-          // own tripling specifically when "Глитч" is active (paint()'s tripling already covers
-          // it) and keep it for every other mode, where paint() does nothing extra on its own.
-          if (glitchOn) {
-            for (let xb = 0; xb < widthLine; xb += grid) {
-              if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-              const px = startX + tx * xb, py = startY + ty * xb;
-              paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
-            }
-          } else {
-            const offs = [-grid, 0, grid];
-            for (let c2 = 0; c2 < 3; c2++) {
+      // FIX ("теряются буквы"): sampling used to stride by RAW POINT INDEX (every ~pts.length/30th
+      // point), which implicitly assumed evenly dense points every ~5px — true for a hand-drawn
+      // stroke (addPoint interpolates that tightly while dragging), so it worked out to roughly 30
+      // samples spread along the stroke. Text-tool strokes are NOT evenly dense: Douglas-Peucker
+      // simplification (see contourToStrokePoints) deliberately leaves long straight stretches of a
+      // letter — a whole vertical bar of "П"/"Т"/"Ш" — with just its two endpoints and nothing in
+      // between, so a point-index stride could skip that entire stretch outright (nothing to land
+      // ON between two sparse points), reading as a chunk of the letter missing. Sampling by actual
+      // travelled DISTANCE along the path instead — same target of ~30 samples, now spread by real
+      // arc length via the segment cache's own lengths — guarantees the whole path gets covered
+      // regardless of how sparse or dense its control points are, hand-drawn or traced letter alike.
+      let totalLen = 0;
+      for (const seg of segs) totalLen += seg.len;
+      const targetSamples = 30;
+      const sampleSpacing = Math.max(1, totalLen / targetSamples);
+      let nextSampleAt = 0;
+      let travelled = 0;
+      for (let segIdx = 0; segIdx < pts.length - 1; segIdx++) {
+        const seg = segs[segIdx];
+        const segLen = seg.len;
+        while (nextSampleAt <= travelled + segLen) {
+          const f = segLen > 0 ? (nextSampleAt - travelled) / segLen : 0;
+          const p0 = pts[segIdx], p1 = pts[segIdx + 1];
+          const sx = p0.x + (p1.x - p0.x) * f, sy = p0.y + (p1.y - p0.y) * f;
+          const hueG = hueAt(segIdx, f);
+          const radius = s.size * (0.8 + s.dynamics * 1.5);
+          const slices = 3 + Math.floor(s.density * 8);
+          const followT = Math.max(0, Math.min(1, s.dynamics));
+          const nx0 = 0, ny0 = 1; // static pose: bars stack vertically, extend horizontally
+          const nx1 = seg.nx, ny1 = seg.ny;
+          let nx = nx0 * (1 - followT) + nx1 * followT;
+          let ny = ny0 * (1 - followT) + ny1 * followT;
+          const nlen = Math.hypot(nx, ny) || 1;
+          nx /= nlen; ny /= nlen;
+          const tx = ny, ty = -nx; // tangent = normal rotated 90°
+          const pT = p0.t + (p1.t - p0.t) * f;
+          for (let i = 0; i < slices; i++) {
+            const yOff = (i / slices - 0.5) * radius * 2;
+            const shift = (hash(Math.floor(tt * 8) + i + pT) * 2) * s.size * (0.3 + s.noise * 2);
+            const widthLine = radius * 2 * (0.6 + Math.random() * 0.4);
+            const baseX = sx + nx * yOff, baseY = sy + ny * yOff;
+            const startX = baseX - tx * (widthLine / 2) + tx * shift;
+            const startY = baseY - ty * (widthLine / 2) + ty * shift;
+            // Per feedback: color moved OUT of this brush entirely and into the "Глитч" MODE (see
+            // target.glitchSplit in paint()/renderStroke) — this brush only shapes the slices now
+            // (position/width/count/density), exactly like every other brush. The triple pass at
+            // [-grid,0,grid] is shape/density (three interleaved offset copies per slice — dropping
+            // it read as too smooth, see earlier fix), NOT color. BUT: in "Глитч" mode specifically,
+            // paint() ALREADY triples every single call into three offset+tinted copies on its own
+            // (target.glitchSplit) — stacking that on top of this brush's own triple pass compounded
+            // into 9 small scattered blocks per step instead of 3, which is exactly what read as
+            // faded/washed out (same total ink spread over 3x the positions). So: skip this brush's
+            // own tripling specifically when "Глитч" is active (paint()'s tripling already covers
+            // it) and keep it for every other mode, where paint() does nothing extra on its own.
+            if (glitchOn) {
               for (let xb = 0; xb < widthLine; xb += grid) {
                 if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-                const off = xb + offs[c2];
-                const px = startX + tx * off, py = startY + ty * off;
+                const px = startX + tx * xb, py = startY + ty * xb;
                 paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+              }
+            } else {
+              const offs = [-grid, 0, grid];
+              for (let c2 = 0; c2 < 3; c2++) {
+                for (let xb = 0; xb < widthLine; xb += grid) {
+                  if (Math.random() > 0.4 + s.intensity * 0.5) continue;
+                  const off = xb + offs[c2];
+                  const px = startX + tx * off, py = startY + ty * off;
+                  paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
+                }
               }
             }
           }
+          nextSampleAt += sampleSpacing;
         }
+        travelled += segLen;
       }
     }
 
