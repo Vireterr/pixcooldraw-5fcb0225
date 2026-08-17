@@ -877,7 +877,7 @@ let layerIdCounter = 0;
 // here needs — every contour is rendered as its own independent Stroke either way). Verified
 // against synthetic test masks (a ring/annulus, multiple disjoint blobs) before wiring in: outer
 // silhouette and hole boundaries both come back as separate, correctly closed loops.
-function traceAllContours(mask: Uint8Array, w: number, h: number): { x: number; y: number }[][] {
+function traceAllContours(mask: Uint8Array, w: number, h: number, minLen: number = 6): { x: number; y: number }[][] {
   const visited = new Uint8Array(w * h);
   const at = (x: number, y: number) => (x < 0 || y < 0 || x >= w || y >= h) ? 0 : mask[y * w + x];
   // 8 neighbor offsets, clockwise, starting West — standard Moore-tracing convention.
@@ -926,7 +926,7 @@ function traceAllContours(mask: Uint8Array, w: number, h: number): { x: number; 
       if (!at(x - 1, y)) {
         const c = traceOne(x, y);
         for (const p of c) visited[p.y * w + p.x] = 1;
-        if (c.length >= 6) contours.push(c); // drop degenerate specks (font hinting artifacts etc.)
+        if (c.length >= minLen) contours.push(c); // drop degenerate specks (font hinting artifacts etc.)
       }
     }
   }
@@ -956,25 +956,68 @@ function rasterizeTextLine(text: string, font: string, sizePx: number, bold: boo
   octx.fillText(text, 2, ascent + 2);
   const { data } = octx.getImageData(0, 0, width, height);
   const mask = new Uint8Array(width * height);
-  for (let i = 0, p = 3; i < mask.length; i++, p += 4) mask[i] = data[p] > 96 ? 1 : 0;
+  for (let i = 0, p = 3; i < mask.length; i++, p += 4) mask[i] = data[p] >= 127 ? 1 : 0;
   return { mask, w: width, h: height, ascent };
 }
 
-// Turns one traced contour (pixel-grid points, tight spacing — one point per boundary pixel step)
-// into a real Stroke path: world-space offset applied, then decimated down to a natural point
-// density (a raw per-pixel contour on a 120px-tall letter can be several hundred points — far
-// denser than anything a hand-drawn stroke would ever produce, and every brush's per-point cost
-// scales with count) while keeping the loop closed (first point repeated at the end) so brushes
-// that draw segment-by-segment wrap all the way around instead of leaving the loop open.
-function contourToStrokePoints(contour: { x: number; y: number }[], offsetX: number, offsetY: number, scale: number): StrokePoint[] {
-  const targetCount = 110;
-  const step = Math.max(1, Math.floor(contour.length / targetCount));
-  const pts: StrokePoint[] = [];
-  for (let i = 0; i < contour.length; i += step) {
-    pts.push({ x: contour[i].x * scale + offsetX, y: contour[i].y * scale + offsetY, t: 0 });
+// Douglas-Peucker polyline simplification (closed loop: run on the loop broken at its two
+// furthest-apart points, then rejoined) — keeps points where the contour actually bends (real
+// corners of a letter) and drops points on segments that are already near-straight, instead of
+// the old fixed "every Nth point" stride which spent the same budget on straight edges and sharp
+// corners alike, rounding off corners and wasting points on stretches that needed none.
+function simplifyDouglasPeucker(pts: { x: number; y: number }[], epsilon: number): { x: number; y: number }[] {
+  if (pts.length < 3) return pts;
+  let maxDist = 0, maxIdx = 0;
+  const a = pts[0], b = pts[pts.length - 1];
+  const abx = b.x - a.x, aby = b.y - a.y;
+  const abLen2 = abx * abx + aby * aby || 1;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const p = pts[i];
+    const t = Math.max(0, Math.min(1, ((p.x - a.x) * abx + (p.y - a.y) * aby) / abLen2));
+    const projX = a.x + abx * t, projY = a.y + aby * t;
+    const d = Math.hypot(p.x - projX, p.y - projY);
+    if (d > maxDist) { maxDist = d; maxIdx = i; }
   }
+  if (maxDist <= epsilon) return [a, b];
+  const left = simplifyDouglasPeucker(pts.slice(0, maxIdx + 1), epsilon);
+  const right = simplifyDouglasPeucker(pts.slice(maxIdx), epsilon);
+  return left.slice(0, -1).concat(right);
+}
+// Chaikin corner-cutting smoothing — runs on the ALREADY-simplified handful of contour points
+// (not on pixels), so it costs nothing extra on the canvas: it's what turns the pixel-grid
+// "staircase" a round letter (О/С/Б) traces into on any raster into a genuinely smooth curve,
+// without rendering a single extra pixel to get there. Two passes is enough to read as round
+// without softening real corners away (each pass only pulls 1/4 of the way toward the corner).
+function chaikinSmooth(pts: { x: number; y: number }[], passes: number): { x: number; y: number }[] {
+  let cur = pts;
+  for (let pass = 0; pass < passes; pass++) {
+    if (cur.length < 3) break;
+    const next: { x: number; y: number }[] = [];
+    for (let i = 0; i < cur.length - 1; i++) {
+      const p0 = cur[i], p1 = cur[i + 1];
+      next.push({ x: p0.x * 0.75 + p1.x * 0.25, y: p0.y * 0.75 + p1.y * 0.25 });
+      next.push({ x: p0.x * 0.25 + p1.x * 0.75, y: p0.y * 0.25 + p1.y * 0.75 });
+    }
+    next.push(cur[cur.length - 1]);
+    cur = next;
+  }
+  return cur;
+}
+// Turns one traced contour (pixel-grid points, tight spacing — one point per boundary pixel step)
+// into a real Stroke path: world-space offset applied, then REWORKED from a fixed "every Nth
+// point" stride into Douglas-Peucker simplification (keeps real corners, drops points wasted on
+// already-straight stretches) followed by light Chaikin smoothing (rounds off the pixel-grid
+// "staircase" a curve traces on any raster) — visually closer to the real letterform at the SAME
+// or lower point count, not more: none of this touches pixels or runs per-frame, it's a one-time
+// pass over a few hundred contour points at most, done once when the text is stamped.
+function contourToStrokePoints(contour: { x: number; y: number }[], offsetX: number, offsetY: number, scale: number): StrokePoint[] {
+  // Simplify BEFORE placing in world space — epsilon is in the same pixel-grid units the raw
+  // contour is already in, so it doesn't need to track the (currently always 1) scale factor.
+  const simplified = simplifyDouglasPeucker(contour, 1.1);
+  const smoothed = chaikinSmooth(simplified, 2);
+  const pts: StrokePoint[] = smoothed.map(p => ({ x: p.x * scale + offsetX, y: p.y * scale + offsetY, t: 0 }));
   // Close the loop explicitly.
-  const c0 = contour[0];
+  const c0 = smoothed[0];
   pts.push({ x: c0.x * scale + offsetX, y: c0.y * scale + offsetY, t: 0 });
   // t values spaced by cumulative travelled distance (0..1) — matches how a real drawn stroke's
   // t/time progresses along its own length, which some brushes (ribbon's wave phase) read from.
@@ -2677,7 +2720,8 @@ function IndexInner() {
       for (const r of rasters) {
         if (!r) continue;
         const ox = x - r.w / 2, oy = cy;
-        const contours = traceAllContours(r.mask, r.w, r.h);
+        const minContourLen = Math.max(4, Math.round(refs.textSize.current * 0.05));
+        const contours = traceAllContours(r.mask, r.w, r.h, minContourLen);
         for (const c of contours) {
           const pts = contourToStrokePoints(c, ox, oy, 1);
           if (pts.length < 2) continue;
