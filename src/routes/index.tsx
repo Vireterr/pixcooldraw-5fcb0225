@@ -39,6 +39,11 @@ interface Stroke {
   mode: ModeKind;
   size: number;
   hue: number;
+  // Full palette support (насыщенность/яркость), captured once at creation just like hue — see
+  // the paint()/renderStroke "satMul/lightShift" adjustment for how these actually reach pixels
+  // without flattening every brush's own internal highlight/shadow variation.
+  sat: number;
+  light: number;
   speed: number;
   density: number;
   noise: number;
@@ -258,6 +263,34 @@ function hueToHex(hue: number): string {
   const toHex = (v: number) => Math.round((v + m) * 255).toString(16).padStart(2, "0");
   return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
 }
+// Full HEX <-> HSL round trip for the MAIN color palette (Оттенок + Насыщенность + Яркость) —
+// separate from hexToHue/hueToHex above, which stay untouched because gradient stop colors
+// (Градиент — цвета) only ever track a hue and deliberately have no saturation/lightness of
+// their own to preserve. This pair is what lets the palette picker/sliders below actually round-
+// trip a real chosen color (pastel, near-black, near-white, low-saturation grey...) instead of
+// always collapsing back to one fixed saturation/lightness the way the hue-only helpers do.
+function hexToHsl(hex: string): { h: number; s: number; l: number } {
+  const r = parseInt(hex.slice(1, 3), 16) / 255;
+  const g = parseInt(hex.slice(3, 5), 16) / 255;
+  const b = parseInt(hex.slice(5, 7), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  let h = 0, s = 0;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r) h = ((g - b) / d + (g < b ? 6 : 0));
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  return { h: Math.round(h), s: Math.round(s * 100), l: Math.round(l * 100) };
+}
+function hslToHex(h: number, s: number, l: number): string {
+  const [r, g, b] = hslToRgb(h, s, l);
+  const toHex = (v: number) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
 // Cyclic interpolation across N user-picked hues, each with its own WEIGHT controlling how much
 // of the 0..1 cycle it occupies (higher weight = that color dominates a larger stretch, and the
 // transition into/out of it takes proportionally longer). t travels continuously (not clamped to
@@ -298,6 +331,16 @@ function sampleGradient(stops: { hue: number; weight: number }[], t: number): nu
 interface PaintTarget {
   mode: "buffer" | "ctx" | "iso";
   buf?: Uint8ClampedArray;
+  // Full palette (Насыщенность/Яркость) adjustment, set unconditionally per stroke (see
+  // renderStroke, right alongside alphaMul) — NOT gated by any mode, unlike spray/rgbShift/chrome
+  // below, since this is the base color pipeline itself, always active. satMul scales whatever
+  // saturation a brush's own effect math authored for that pixel (proportionally, so a brush's own
+  // relative highlight/shadow/spark contrast survives); lightShift adds a flat offset to whatever
+  // lightness it authored (shifts the whole tonal range up/down without flattening the shape of
+  // its own light/dark variation). Baseline is (90, 60) — the app's old fixed default — so picking
+  // exactly that in the palette reproduces today's colors unchanged.
+  satMul?: number;
+  lightShift?: number;
   // PERF: a Uint32Array view over the same ArrayBuffer as `buf`, "buffer" mode only. Lets paint()
   // write a fully-opaque pixel as ONE 32-bit store instead of four separate byte stores — only
   // valid when there's no real blending to do (alpha >= 1), since it overwrites all 4 channels at
@@ -398,6 +441,24 @@ function rgbToHue(r: number, g: number, b: number): number {
   else h = (rf - gf) / d + 4;
   h *= 60;
   return h < 0 ? h + 360 : h;
+}
+// Full RGB->HSL for the eyedropper — companion to rgbToHue above, used now that the app has a
+// real saturation/lightness pipeline: sampling a pixel picks up its actual pastel/dark/light
+// character too, not just its hue.
+function rgbToHsl(r: number, g: number, b: number): { h: number; s: number; l: number } {
+  const rf = r / 255, gf = g / 255, bf = b / 255;
+  const max = Math.max(rf, gf, bf), min = Math.min(rf, gf, bf);
+  const l = (max + min) / 2;
+  let h = 0, s = 0;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === rf) h = ((gf - bf) / d + (gf < bf ? 6 : 0));
+    else if (max === gf) h = (bf - rf) / d + 2;
+    else h = (rf - gf) / d + 4;
+    h *= 60;
+  }
+  return { h: Math.round(h), s: Math.round(s * 100), l: Math.round(l * 100) };
 }
 // Real Porter-Duff "over" for one pixel of an isolated (non-opaque) buffer — used only while baking
 // a frozen stroke, which happens once per stroke rather than every frame, so the extra per-pixel
@@ -517,6 +578,11 @@ function paintChannel(target: PaintTarget, x: number, y: number, sizeW: number, 
 }
 function paint(target: PaintTarget, x: number, y: number, sizeW: number, sizeH: number, h: number, s: number, l: number, a: number) {
   if (a <= 0) return;
+  // Full palette (Насыщенность/Яркость): applied FIRST, before any mode reshapes color further
+  // (Хром/Глитч/RGB сдвиг all derive their own colors from s/l too, via getHslRgb, so adjusting
+  // here once covers every one of them automatically instead of needing a separate patch per mode).
+  if (target.satMul !== undefined) s = Math.max(0, Math.min(100, s * target.satMul));
+  if (target.lightShift !== undefined) l = Math.max(0, Math.min(100, l + target.lightShift));
   // Generic "Распыление" scatter: random sparse skip + small positional jitter, applied at the one
   // place every brush's coloring funnels through — so spray mode does something for whichever brush
   // is active, without needing brush-specific spray code everywhere.
@@ -940,7 +1006,7 @@ function serializeStroke(s: Stroke): string {
   const cached = strokeSerCache.get(s);
   if (cached !== undefined) return cached;
   const json = JSON.stringify({
-    id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue,
+    id: s.id, kind: s.kind, mode: s.mode, size: s.size, hue: s.hue, sat: s.sat, light: s.light,
     speed: s.speed, density: s.density, noise: s.noise,
     intensity: s.intensity, dynamics: s.dynamics, modeSpeed: s.modeSpeed,
     pulseOn: s.pulseOn, mirrorOn: s.mirrorOn, sprayOn: s.sprayOn,
@@ -1144,6 +1210,11 @@ function IndexInner() {
   // keep whatever behavior they were born with.
   const [animEnabled, setAnimEnabled] = useState(true);
   const [hue, setHue] = useState(200);
+  // Full palette: насыщенность/яркость, alongside the existing hue slider. Defaults (90, 60)
+  // exactly match the app's old hardcoded colors, so nothing changes visually until the person
+  // actually touches the picker/sliders.
+  const [colorSat, setColorSat] = useState(90);
+  const [colorLight, setColorLight] = useState(60);
   const [size, setSize] = useState(28);
   const [speed, setSpeed] = useState(0.5);
   const [density, setDensity] = useState(0.5);
@@ -1351,7 +1422,7 @@ function IndexInner() {
   };
 
   const refs = {
-    brush: useRef(brush), mode: useRef(mode), hue: useRef(hue), size: useRef(size),
+    brush: useRef(brush), mode: useRef(mode), hue: useRef(hue), colorSat: useRef(colorSat), colorLight: useRef(colorLight), size: useRef(size),
     speed: useRef(speed), density: useRef(density), noise: useRef(noise),
     intensity: useRef(intensity), dynamics: useRef(dynamics),
     modeSpeed: useRef(modeSpeed),
@@ -1375,6 +1446,8 @@ function IndexInner() {
   useEffect(() => { refs.brush.current = brush; });
   useEffect(() => { refs.mode.current = mode; });
   useEffect(() => { refs.hue.current = hue; });
+  useEffect(() => { refs.colorSat.current = colorSat; });
+  useEffect(() => { refs.colorLight.current = colorLight; });
   useEffect(() => { refs.size.current = size; });
   useEffect(() => { refs.speed.current = speed; });
   useEffect(() => { refs.density.current = density; });
@@ -1615,6 +1688,11 @@ function IndexInner() {
     const modeHueShift = s.mode === "rainbow" ? (lifeMs * (s.rainbowFlow ? 0.05 : s.rainbowBlinkSpeed * 0.1)) % 360 : 0;
     const modePulse = s.pulseOn ? 0.6 + 0.5 * Math.sin(mt * (0.5 + ms * 3)) : 1;
     const alphaMul = (0.25 + s.intensity * 0.9) * modePulse;
+    // Full palette — always active (not mode-gated), set once per stroke so every paint() call
+    // this stroke makes picks it up automatically. Baseline (90, 60) reproduces the app's old
+    // fixed colors exactly when the user hasn't touched Насыщенность/Яркость from their defaults.
+    target.satMul = (s.sat ?? 90) / 90;
+    target.lightShift = (s.light ?? 60) - 60;
     const pts = s.points;
     // "Радуга: Поток" keeps its original simple full-spectrum sweep, unchanged.
     // "Градиент" is now fully independent and spatial. Its base direction is auto-derived from
@@ -1702,9 +1780,11 @@ function IndexInner() {
       if (s.mode === "gradient") {
         const RAMP = 96;
         const ramp: [number, number, number][] = new Array(RAMP);
+        const fillS = Math.max(0, Math.min(100, 85 * (target.satMul ?? 1)));
+        const fillL = Math.max(0, Math.min(100, 55 + (target.lightShift ?? 0)));
         for (let k = 0; k < RAMP; k++) {
           const hueK = sampleGradient(s.gradientColors, k / RAMP + gradTravel);
-          ramp[k] = getHslRgb(hueK, 85, 55);
+          ramp[k] = getHslRgb(hueK, fillS, fillL);
         }
         if (target.mode === "buffer") {
           const buf = target.buf!;
@@ -1744,8 +1824,10 @@ function IndexInner() {
         }
       } else {
         const hueF = hueAt(0, 0);
+        const fillS = Math.max(0, Math.min(100, 85 * (target.satMul ?? 1)));
+        const fillL = Math.max(0, Math.min(100, 55 + (target.lightShift ?? 0)));
         if (target.mode === "buffer") {
-          const [r, g, b] = getHslRgb(hueF, 85, 55);
+          const [r, g, b] = getHslRgb(hueF, fillS, fillL);
           const buf = target.buf!;
           for (let yy = by0; yy < by1; yy++) {
             for (let xx = bx0; xx < bx1; xx++) {
@@ -1759,7 +1841,7 @@ function IndexInner() {
             }
           }
         } else if (target.mode === "iso") {
-          const [r, g, b] = getHslRgb(hueF, 85, 55);
+          const [r, g, b] = getHslRgb(hueF, fillS, fillL);
           const buf = target.buf!, alphaBuf = target.alphaBuf!;
           for (let yy = by0; yy < by1; yy++) {
             for (let xx = bx0; xx < bx1; xx++) {
@@ -2408,7 +2490,10 @@ function IndexInner() {
       const sy = Math.min(h - 1, Math.max(0, Math.round(y)));
       const idx = (sy * w + sx) * 4;
       const r = bufObj.data[idx], g = bufObj.data[idx + 1], b = bufObj.data[idx + 2];
-      setHue(Math.round(rgbToHue(r, g, b)));
+      const picked = rgbToHsl(r, g, b);
+      setHue(picked.h);
+      setColorSat(picked.s);
+      setColorLight(picked.l);
       return;
     }
 
@@ -2470,6 +2555,8 @@ function IndexInner() {
         mode: refs.mode.current,
         size: refs.size.current,
         hue: refs.hue.current,
+        sat: refs.colorSat.current,
+        light: refs.colorLight.current,
         speed: refs.speed.current,
         density: refs.density.current,
         noise: refs.noise.current,
@@ -2524,6 +2611,8 @@ function IndexInner() {
         mode: refs.mode.current,
         size: refs.size.current,
         hue: refs.hue.current,
+        sat: refs.colorSat.current,
+        light: refs.colorLight.current,
         speed: refs.speed.current,
         density: refs.density.current,
         noise: refs.noise.current,
@@ -2616,6 +2705,8 @@ function IndexInner() {
       mode: refs.mode.current,
       size: refs.size.current,
       hue: refs.hue.current,
+      sat: refs.colorSat.current,
+      light: refs.colorLight.current,
       speed: refs.speed.current,
       density: refs.density.current,
       noise: refs.noise.current,
@@ -3486,24 +3577,53 @@ function IndexInner() {
               <span>Цвет</span>
               {/* Кликабельный ярлычок цвета: под кружком реального размера лежит настоящий
                   <input type="color"> (растянут на всю площадь через absolute+inset-0, просто
-                  невидим), так что клик открывает нативную палитру браузера (цвет/оттенок/
-                  насыщенность/HEX и т.д.). Раньше инпут был схлопнут в 0×0 — в части браузеров
-                  такой инпут не открывает палитру по клику на обёртку, даже если это <label>. */}
+                  невидим), так что клик открывает нативную палитру браузера. Раньше инпут был
+                  схлопнут в 0×0 — в части браузеров такой инпут не открывает палитру по клику на
+                  обёртку, даже если это <label>.
+                  ПОЛНАЯ ПАЛИТРА: кружок и value теперь строятся из hue+colorSat+colorLight (через
+                  hslToHex), а не из одного оттенка с зашитыми 90%/60% — то есть в палитре видно и
+                  получаешь обратно ИМЕННО тот цвет, что выбрал (пастель, почти чёрный/белый,
+                  серый — весь спектр), а не всегда пересобранный "чистый" тон. onChange разбирает
+                  выбранный HEX через hexToHsl и обновляет все три ручки (hue/colorSat/colorLight)
+                  разом, так что бегунки ниже сразу показывают то, что было выбрано в палитре. */}
               <span className="relative h-4 w-4 shrink-0" title="Открыть палитру">
                 <span
                   className="pointer-events-none absolute inset-0 rounded-full border border-white/30"
-                  style={{ backgroundColor: `hsl(${hue}, 90%, 60%)` }}
+                  style={{ backgroundColor: `hsl(${hue}, ${colorSat}%, ${colorLight}%)` }}
                 />
                 <input
                   type="color"
-                  value={hueToHex(hue)}
-                  onChange={(e) => setHue(hexToHue(e.target.value))}
+                  value={hslToHex(hue, colorSat, colorLight)}
+                  onChange={(e) => {
+                    const picked = hexToHsl(e.target.value);
+                    setHue(picked.h);
+                    setColorSat(picked.s);
+                    setColorLight(picked.l);
+                  }}
                   className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
                 />
               </span>
             </span>
-            <input type="range" min={0} max={360} value={hue} onChange={(e) => setHue(+e.target.value)} className="w-full" style={{ background: "linear-gradient(to right, hsl(0,90%,60%), hsl(60,90%,60%), hsl(120,90%,60%), hsl(180,90%,60%), hsl(240,90%,60%), hsl(300,90%,60%), hsl(360,90%,60%))", appearance: "none", height: 6, borderRadius: 999 }} />
+            <input type="range" min={0} max={360} value={hue} onChange={(e) => setHue(+e.target.value)} className="w-full" style={{ background: `linear-gradient(to right, hsl(0,${colorSat}%,${colorLight}%), hsl(60,${colorSat}%,${colorLight}%), hsl(120,${colorSat}%,${colorLight}%), hsl(180,${colorSat}%,${colorLight}%), hsl(240,${colorSat}%,${colorLight}%), hsl(300,${colorSat}%,${colorLight}%), hsl(360,${colorSat}%,${colorLight}%))`, appearance: "none", height: 6, borderRadius: 999 }} />
           </div>
+          <label className="block text-[10px] uppercase tracking-widest text-white/50">
+            <span className="mb-1 flex justify-between"><span>Насыщенность</span><span className="text-white/80">{colorSat}%</span></span>
+            <input
+              type="range" min={0} max={100} value={colorSat}
+              onChange={(e) => setColorSat(+e.target.value)}
+              className="w-full"
+              style={{ background: `linear-gradient(to right, hsl(${hue},0%,${colorLight}%), hsl(${hue},100%,${colorLight}%))`, appearance: "none", height: 6, borderRadius: 999 }}
+            />
+          </label>
+          <label className="block text-[10px] uppercase tracking-widest text-white/50">
+            <span className="mb-1 flex justify-between"><span>Яркость</span><span className="text-white/80">{colorLight}%</span></span>
+            <input
+              type="range" min={0} max={100} value={colorLight}
+              onChange={(e) => setColorLight(+e.target.value)}
+              className="w-full"
+              style={{ background: `linear-gradient(to right, hsl(${hue},${colorSat}%,0%), hsl(${hue},${colorSat}%,50%), hsl(${hue},${colorSat}%,100%))`, appearance: "none", height: 6, borderRadius: 999 }}
+            />
+          </label>
         </section>
 
         {/* Params */}
