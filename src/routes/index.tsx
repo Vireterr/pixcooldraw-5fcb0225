@@ -1284,6 +1284,11 @@ function IndexInner() {
   const [textSize, setTextSize] = useState(72);
   const [textBold, setTextBold] = useState(true);
   const [textBrush, setTextBrush] = useState<BrushKind>("ink");
+  // Direct, independent control over the letter-brush's effect thickness — NOT combined/clamped
+  // against the main "Размер" slider (that's what made the earlier version confusing: the actual
+  // result was whichever of the two was smaller, so moving this slider sometimes visibly did
+  // nothing if "Размер" was already the limiting one). This value alone is what text strokes use.
+  const [textEffectSize, setTextEffectSize] = useState(24);
   const [recording, setRecording] = useState<null | "gif" | "mp4">(null);
   const [recordProgress, setRecordProgress] = useState(0);
   const [gifQ, setGifQ] = useState<GifQ>("medium");
@@ -1470,6 +1475,7 @@ function IndexInner() {
     textSize: useRef(textSize),
     textBold: useRef(textBold),
     textBrush: useRef(textBrush),
+    textEffectSize: useRef(textEffectSize),
   };
   useEffect(() => { refs.brush.current = brush; });
   useEffect(() => { refs.mode.current = mode; });
@@ -1501,6 +1507,7 @@ function IndexInner() {
   useEffect(() => { refs.textSize.current = textSize; });
   useEffect(() => { refs.textBold.current = textBold; });
   useEffect(() => { refs.textBrush.current = textBrush; });
+  useEffect(() => { refs.textEffectSize.current = textEffectSize; });
 
   // Create the Pixi Application — and with it, the ONE WebGL context it owns — exactly once for
   // this component's lifetime, NOT per canvasSize change. Recreating the whole Application (a brand
@@ -2107,14 +2114,40 @@ function IndexInner() {
       const wantRain = Math.floor(10 + s.density * 80);
       const rainTargetCount = Math.min(wantRain, currentRainCount + Math.max(0, opts.rainBudget.left));
       if (!s.rain) s.rain = [];
+      // FIX ("буквы теряются"): spawn point used to be a uniformly random RAW POINT INDEX, which
+      // implicitly assumed evenly dense points — on a text-tool stroke (sparse points on long
+      // straight letter edges after Douglas-Peucker simplification) that meant rain only ever
+      // spawned near the handful of kept points (letter corners), leaving long straight edges
+      // with no rain falling from them at all. Picking a uniformly random DISTANCE along the
+      // path instead (and interpolating within whichever segment contains it) spawns rain evenly
+      // across the actual shape regardless of how sparse or dense its control points are.
+      const segsR = pts.length > 1 ? getSegCache(s, pts, grid) : [];
+      let totalLenR = 0;
+      for (const sg of segsR) totalLenR += sg.len;
       while (s.rain.length < rainTargetCount && opts.rainBudget.left > 0) {
-        const idx = Math.floor(Math.random() * pts.length);
-        const p = pts[idx];
+        let px: number, py: number, posFrac: number;
+        if (totalLenR > 0) {
+          const targetDist = Math.random() * totalLenR;
+          let acc = 0, segIdx = 0;
+          for (; segIdx < segsR.length; segIdx++) {
+            if (acc + segsR[segIdx].len >= targetDist) break;
+            acc += segsR[segIdx].len;
+          }
+          segIdx = Math.min(segIdx, segsR.length - 1);
+          const segLen = segsR[segIdx].len;
+          const f = segLen > 0 ? (targetDist - acc) / segLen : 0;
+          const p0 = pts[segIdx], p1 = pts[Math.min(segIdx + 1, pts.length - 1)];
+          px = p0.x + (p1.x - p0.x) * f;
+          py = p0.y + (p1.y - p0.y) * f;
+          posFrac = (segIdx + f) / nSeg;
+        } else {
+          px = pts[0].x; py = pts[0].y; posFrac = 0;
+        }
         s.rain.push({
-          x: Math.round(p.x / grid + gridPhaseX) * grid + (Math.random() - 0.5) * s.size,
-          y: p.y,
+          x: Math.round(px / grid + gridPhaseX) * grid + (Math.random() - 0.5) * s.size,
+          y: py,
           vy: 0.5 + Math.random() * 2 * (0.3 + s.dynamics * 2),
-          hue: s.mode === "gradient" ? gradientHueAtXY(p.x, p.y) : s.hue + (Math.random() - 0.5) * 40 + legacySpread * idx / nSeg,
+          hue: s.mode === "gradient" ? gradientHueAtXY(px, py) : s.hue + (Math.random() - 0.5) * 40 + legacySpread * posFrac,
           len: 3 + Math.floor(Math.random() * 8 * (0.3 + s.dynamics)),
           seed: Math.random() * 1000,
         });
@@ -2237,41 +2270,62 @@ function IndexInner() {
 
     else if (s.kind === "pixelGlitch2") {
       const grid = Math.max(2, Math.round(s.size / 6));
-      const stepPts = Math.max(1, Math.floor(pts.length / 30));
-      for (let pi = 0; pi < pts.length; pi += stepPts) {
-        const p = pts[pi];
-        const hueG = hueAt(pi);
-        const radius = s.size * (0.8 + s.dynamics * 1.5);
-        const slices = 3 + Math.floor(s.density * 8);
-        for (let i = 0; i < slices; i++) {
-          const yOff = (i / slices - 0.5) * radius * 2;
-          const shift = (hash(Math.floor(tt * 8) + i + p.t) * 2) * s.size * (0.3 + s.noise * 2);
-          const widthLine = radius * 2 * (0.6 + Math.random() * 0.4);
-          const x0 = p.x - widthLine / 2 + shift;
-          const y0 = Math.round((p.y + yOff) / grid) * grid;
-          const offs = [-grid, 0, grid];
-          let hues: number[];
-          if (s.mode === "gradient") {
-            // Sample the actual chosen palette at three nearby positions instead of a synthetic
-            // +120/+240 hue offset — otherwise the channel-split always looks like a generic RGB
-            // trio no matter which colors were picked, making the tool feel unresponsive to them.
-            const spread = 0.035;
-            const basePos = (p.x * gradCos + p.y * gradSin) / gradExtent + gradTravel;
-            hues = [
-              sampleGradient(s.gradientColors, basePos - spread),
-              sampleGradient(s.gradientColors, basePos),
-              sampleGradient(s.gradientColors, basePos + spread),
-            ];
-          } else {
-            hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
-          }
-          for (let c2 = 0; c2 < 3; c2++) {
-            for (let xb = 0; xb < widthLine; xb += grid) {
-              if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-              paint(target, Math.round((x0 + xb + offs[c2]) / grid) * grid, y0, grid, grid, hues[c2], 100, 55, alphaMul * 0.55);
+      // FIX ("буквы теряются") — same root cause as "Глитч" above: point-index sampling assumed
+      // evenly dense points (true for a hand-drawn stroke, not true for text-tool strokes, whose
+      // long straight stretches are left with just 2 points by Douglas-Peucker simplification —
+      // see contourToStrokePoints). A whole straight part of a letter could fall entirely between
+      // two sparse points and never get sampled. Sample by real travelled distance instead — same
+      // target of ~30 samples, spread by actual arc length — so coverage no longer depends on how
+      // densely or sparsely the stroke's own control points happen to be spaced. Rest of the brush
+      // (color logic, horizontal slice shape, random keep/skip) is unchanged.
+      let totalLen = 0;
+      for (let i = 0; i < pts.length - 1; i++) totalLen += Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+      const targetSamples = 30;
+      const sampleSpacing = Math.max(1, totalLen / targetSamples);
+      let nextSampleAt = 0;
+      let travelled = 0;
+      for (let segIdx = 0; segIdx < pts.length - 1; segIdx++) {
+        const p0 = pts[segIdx], p1 = pts[segIdx + 1];
+        const segLen = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+        while (nextSampleAt <= travelled + segLen) {
+          const f = segLen > 0 ? (nextSampleAt - travelled) / segLen : 0;
+          const px = p0.x + (p1.x - p0.x) * f, py = p0.y + (p1.y - p0.y) * f;
+          const pT = p0.t + (p1.t - p0.t) * f;
+          const hueG = hueAt(segIdx, f);
+          const radius = s.size * (0.8 + s.dynamics * 1.5);
+          const slices = 3 + Math.floor(s.density * 8);
+          for (let i = 0; i < slices; i++) {
+            const yOff = (i / slices - 0.5) * radius * 2;
+            const shift = (hash(Math.floor(tt * 8) + i + pT) * 2) * s.size * (0.3 + s.noise * 2);
+            const widthLine = radius * 2 * (0.6 + Math.random() * 0.4);
+            const x0 = px - widthLine / 2 + shift;
+            const y0 = Math.round((py + yOff) / grid) * grid;
+            const offs = [-grid, 0, grid];
+            let hues: number[];
+            if (s.mode === "gradient") {
+              // Sample the actual chosen palette at three nearby positions instead of a synthetic
+              // +120/+240 hue offset — otherwise the channel-split always looks like a generic RGB
+              // trio no matter which colors were picked, making the tool feel unresponsive to them.
+              const spread = 0.035;
+              const basePos = (px * gradCos + py * gradSin) / gradExtent + gradTravel;
+              hues = [
+                sampleGradient(s.gradientColors, basePos - spread),
+                sampleGradient(s.gradientColors, basePos),
+                sampleGradient(s.gradientColors, basePos + spread),
+              ];
+            } else {
+              hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
+            }
+            for (let c2 = 0; c2 < 3; c2++) {
+              for (let xb = 0; xb < widthLine; xb += grid) {
+                if (Math.random() > 0.4 + s.intensity * 0.5) continue;
+                paint(target, Math.round((x0 + xb + offs[c2]) / grid) * grid, y0, grid, grid, hues[c2], 100, 55, alphaMul * 0.55);
+              }
             }
           }
+          nextSampleAt += sampleSpacing;
         }
+        travelled += segLen;
       }
     }
 
@@ -2281,7 +2335,6 @@ function IndexInner() {
       // that point every frame instead of reshuffling) instead of one uniform cell size — reads as
       // an irregular mosaic of tile sizes rather than a single fine grid.
       const baseGrid = Math.max(3, Math.round(s.size / 4));
-      const stepPts = Math.max(1, Math.floor(pts.length / 40));
       const radius = s.size * (1 + s.dynamics * 1.5);
       const coverage = 0.4 + s.density * 0.6;
       // Same fix as Дизеринг: narrower swing (was 0.22, synchronized across the whole area) so
@@ -2292,35 +2345,59 @@ function IndexInner() {
       // near zero means the stroke itself intermittently vanishes to background for part of every
       // cycle, not just "looks dimmer."
       const sweep = 0.5 + 0.08 * Math.sin(tt * (0.35 + s.speed * 1.2) * Math.PI * 2);
-      for (let pi = 0; pi < pts.length; pi += stepPts) {
-        const p = pts[pi];
-        const hueM = hueAt(pi);
-        const pointJitter = (noiseAt(pi * 17 + 3) - 0.5) * 0.16;
-        const sweepP = sweep + pointJitter;
-        const sizeClass = noiseAt(pi * 131 + Math.floor(p.x) * 7 + Math.floor(p.y) * 13);
-        const grid = baseGrid * (sizeClass > 0.5 ? 3 : sizeClass > 0 ? 2 : 1);
-        const cx = Math.round(p.x / grid + gridPhaseX) * grid, cy = Math.round(p.y / grid + gridPhaseY) * grid;
-        const cellsAcross = Math.max(1, Math.ceil(radius / grid));
-        for (let gy = -cellsAcross; gy <= cellsAcross; gy++) {
-          for (let gx = -cellsAcross; gx <= cellsAcross; gx++) {
-            const wx = cx + gx * grid, wy = cy + gy * grid;
-            const dist = Math.hypot(wx - p.x, wy - p.y) / radius;
-            if (dist > 1) continue;
-            const grain = noiseAt(Math.round(wx / grid) * 7 + Math.round(wy / grid) * 13);
-            // Baseline grain weight (0.15) independent of the noise slider — same reasoning as
-            // Дизеринг: without it, at noise=0 every tile shares nearly the same threshold and
-            // pops in/out together across a wide area, reading as a sitewide haze.
-            const threshold = (sweepP + grain * (0.15 + s.noise * 0.4)) * coverage;
-            if (dist > threshold) continue;
-            // FIX: lit/alpha used to both scale by (1-dist) from the sample point — every cluster of
-            // tiles faded out radially toward its edge, which is exactly what read as "circles of
-            // blurred pixels" instead of a flat mosaic. Tiles are flat now: brightness only varies by
-            // the tile's own fixed per-cell grain (real mosaic texture), never by distance, so there's
-            // no soft circular falloff anywhere — just solid squares of different sizes, on or off.
-            const lit = 48 + grain * 14;
-            paint(target, wx, wy, grid, grid, hueM, 90, lit, alphaMul);
+      // FIX ("буквы теряются"): sampling used to stride by RAW POINT INDEX (every ~pts.length/40th
+      // point) — same root cause as "Глитч" above. On a text-tool stroke, Douglas-Peucker leaves
+      // long straight stretches of a letter with only their two endpoints, so a point-index stride
+      // could skip the entire stretch (each sample only paints out to `radius` around it — if the
+      // gap between the two sparse points exceeds that reach, the middle of the stretch is left
+      // untouched, background showing straight through the middle of the letter). Sampling by real
+      // travelled distance instead — same target of ~40 samples, spread by actual arc length via
+      // the segment cache's own lengths — keeps consecutive samples close enough for their radii to
+      // overlap and fully cover the shape, regardless of how sparse the control points are.
+      const segsM = getSegCache(s, pts, baseGrid);
+      let totalLenM = 0;
+      for (const sg of segsM) totalLenM += sg.len;
+      const targetSamplesM = 40;
+      const sampleSpacingM = Math.max(1, totalLenM / targetSamplesM);
+      let nextSampleAtM = 0;
+      let travelledM = 0;
+      for (let segIdx = 0; segIdx < pts.length - 1; segIdx++) {
+        const segLen = segsM[segIdx].len;
+        const p0 = pts[segIdx], p1 = pts[segIdx + 1];
+        while (nextSampleAtM <= travelledM + segLen) {
+          const f = segLen > 0 ? (nextSampleAtM - travelledM) / segLen : 0;
+          const px = p0.x + (p1.x - p0.x) * f, py = p0.y + (p1.y - p0.y) * f;
+          const sampleKey = segIdx + f;
+          const hueM = hueAt(segIdx, f);
+          const pointJitter = (noiseAt(sampleKey * 17 + 3) - 0.5) * 0.16;
+          const sweepP = sweep + pointJitter;
+          const sizeClass = noiseAt(sampleKey * 131 + Math.floor(px) * 7 + Math.floor(py) * 13);
+          const grid = baseGrid * (sizeClass > 0.5 ? 3 : sizeClass > 0 ? 2 : 1);
+          const cx = Math.round(px / grid + gridPhaseX) * grid, cy = Math.round(py / grid + gridPhaseY) * grid;
+          const cellsAcross = Math.max(1, Math.ceil(radius / grid));
+          for (let gy = -cellsAcross; gy <= cellsAcross; gy++) {
+            for (let gx = -cellsAcross; gx <= cellsAcross; gx++) {
+              const wx = cx + gx * grid, wy = cy + gy * grid;
+              const dist = Math.hypot(wx - px, wy - py) / radius;
+              if (dist > 1) continue;
+              const grain = noiseAt(Math.round(wx / grid) * 7 + Math.round(wy / grid) * 13);
+              // Baseline grain weight (0.15) independent of the noise slider — same reasoning as
+              // Дизеринг: without it, at noise=0 every tile shares nearly the same threshold and
+              // pops in/out together across a wide area, reading as a sitewide haze.
+              const threshold = (sweepP + grain * (0.15 + s.noise * 0.4)) * coverage;
+              if (dist > threshold) continue;
+              // FIX: lit/alpha used to both scale by (1-dist) from the sample point — every cluster of
+              // tiles faded out radially toward its edge, which is exactly what read as "circles of
+              // blurred pixels" instead of a flat mosaic. Tiles are flat now: brightness only varies by
+              // the tile's own fixed per-cell grain (real mosaic texture), never by distance, so there's
+              // no soft circular falloff anywhere — just solid squares of different sizes, on or off.
+              const lit = 48 + grain * 14;
+              paint(target, wx, wy, grid, grid, hueM, 90, lit, alphaMul);
+            }
           }
+          nextSampleAtM += sampleSpacingM;
         }
+        travelledM += segLen;
       }
     }
 
@@ -2337,23 +2414,43 @@ function IndexInner() {
       // Each coal still flares/dims on its own out-of-sync cycle (a per-seed phase offset, exactly
       // like before) so it still reads as smoldering, not static — it just no longer disappears.
       const grid = Math.max(3, Math.round(s.size / 4));
-      const stepPts = Math.max(1, Math.floor(pts.length / 60));
       const perPoint = Math.max(1, Math.round(1 + s.density * 5));
-      for (let pi = 0; pi < pts.length; pi += stepPts) {
-        const p = pts[pi];
-        for (let k = 0; k < perPoint; k++) {
-          const seed = pi * 97 + k * 13;
-          const ex = p.x + noiseAt(seed) * s.size * 0.6;
-          const ey = p.y + noiseAt(seed + 5000) * s.size * 0.6;
-          const period = 1.2 + ((noiseAt(seed + 1) + 1) / 2) * 2.5;
-          const phase = ((noiseAt(seed + 2) + 1) / 2) * Math.PI * 2;
-          const glow = 0.5 + 0.5 * Math.sin((tt * 2 * Math.PI) / period + phase);
-          const lit = 20 + glow * (30 + s.intensity * 20);
-          const hueE = s.mode === "gradient"
-            ? gradientHueAtXY(ex, ey)
-            : (s.hue + noiseAt(seed + 3) * 30 + modeHueShift) % 360;
-          paint(target, Math.round(ex / grid + gridPhaseX) * grid, Math.round(ey / grid + gridPhaseY) * grid, grid, grid, hueE, 85, lit, alphaMul * (0.3 + glow * 0.7));
+      // FIX ("буквы теряются") — same root cause as "Глитч"/"Мозаика" above: point-index sampling
+      // assumed evenly dense points. Each sample only scatters its coals within ~size*0.6 of
+      // itself, so a text-tool stroke's sparse straight stretches (Douglas-Peucker leaves only 2
+      // points on a long straight letter edge) could leave the whole middle of that stretch with
+      // no coals at all. Sampling by real travelled distance — same target of ~60 samples, spread
+      // by actual arc length — keeps consecutive samples close enough to cover the whole path.
+      const segsE = getSegCache(s, pts, grid);
+      let totalLenE = 0;
+      for (const sg of segsE) totalLenE += sg.len;
+      const targetSamplesE = 60;
+      const sampleSpacingE = Math.max(1, totalLenE / targetSamplesE);
+      let nextSampleAtE = 0;
+      let travelledE = 0;
+      for (let segIdx = 0; segIdx < pts.length - 1; segIdx++) {
+        const segLen = segsE[segIdx].len;
+        const p0 = pts[segIdx], p1 = pts[segIdx + 1];
+        while (nextSampleAtE <= travelledE + segLen) {
+          const f = segLen > 0 ? (nextSampleAtE - travelledE) / segLen : 0;
+          const px = p0.x + (p1.x - p0.x) * f, py = p0.y + (p1.y - p0.y) * f;
+          const sampleKey = segIdx + f;
+          for (let k = 0; k < perPoint; k++) {
+            const seed = sampleKey * 97 + k * 13;
+            const ex = px + noiseAt(seed) * s.size * 0.6;
+            const ey = py + noiseAt(seed + 5000) * s.size * 0.6;
+            const period = 1.2 + ((noiseAt(seed + 1) + 1) / 2) * 2.5;
+            const phase = ((noiseAt(seed + 2) + 1) / 2) * Math.PI * 2;
+            const glow = 0.5 + 0.5 * Math.sin((tt * 2 * Math.PI) / period + phase);
+            const lit = 20 + glow * (30 + s.intensity * 20);
+            const hueE = s.mode === "gradient"
+              ? gradientHueAtXY(ex, ey)
+              : (s.hue + noiseAt(seed + 3) * 30 + modeHueShift) % 360;
+            paint(target, Math.round(ex / grid + gridPhaseX) * grid, Math.round(ey / grid + gridPhaseY) * grid, grid, grid, hueE, 85, lit, alphaMul * (0.3 + glow * 0.7));
+          }
+          nextSampleAtE += sampleSpacingE;
         }
+        travelledE += segLen;
       }
     }
 
@@ -2661,7 +2758,7 @@ function IndexInner() {
       const w = canvasSize.w, h = canvasSize.h;
       const commonFields = {
         mode: refs.mode.current,
-        size: refs.size.current,
+        size: refs.textEffectSize.current,
         hue: refs.hue.current,
         sat: refs.colorSat.current,
         light: refs.colorLight.current,
@@ -2690,9 +2787,10 @@ function IndexInner() {
       if (refs.textBrush.current === "fill") {
         const combined = new Uint8Array(w * h);
         let cy = y - totalH / 2;
+        const blockOxFill = Math.round(x - maxW / 2);
         for (const r of rasters) {
           if (!r) continue;
-          const ox = Math.round(x - r.w / 2), oy = Math.round(cy);
+          const ox = blockOxFill, oy = Math.round(cy);
           for (let py = 0; py < r.h; py++) {
             const wy = oy + py;
             if (wy < 0 || wy >= h) continue;
@@ -2726,9 +2824,17 @@ function IndexInner() {
       // by a stray line the way one shared point list would.
       const newStrokes: Stroke[] = [];
       let cy = y - totalH / 2;
+      // FIX ("положение букв не совпадает с окном ввода"): every line used to be centered under
+      // the click point using ITS OWN width (ox = x - r.w/2), independently of every other line —
+      // so on a multi-line block a shorter line's left edge would shift inward relative to a
+      // longer one. That doesn't match the textarea, where every line shares the SAME left edge
+      // (left-aligned by default) regardless of its own length. Anchoring every line to the same
+      // shared left edge (based on the whole block's maxW, computed once above) reproduces that
+      // same left-aligned relationship between lines on the canvas.
+      const blockOx = x - maxW / 2;
       for (const r of rasters) {
         if (!r) continue;
-        const ox = x - r.w / 2, oy = cy;
+        const ox = blockOx, oy = cy;
         const minContourLen = Math.max(4, Math.round(refs.textSize.current * 0.05));
         const contours = traceAllContours(r.mask, r.w, r.h, minContourLen);
         for (const c of contours) {
@@ -3452,6 +3558,13 @@ function IndexInner() {
               <label className="block text-[10px] uppercase tracking-widest text-white/50">
                 <span className="mb-1 flex justify-between"><span>Размер шрифта</span><span className="text-white/80">{textSize}px</span></span>
                 <input type="range" min={16} max={280} value={textSize} onChange={(e) => setTextSize(+e.target.value)} className="w-full accent-white" />
+              </label>
+              <label className="block text-[10px] uppercase tracking-widest text-white/50">
+                <span className="mb-1 flex justify-between"><span>Толщина эффекта</span><span className="text-white/80">{textEffectSize}</span></span>
+                <input type="range" min={4} max={120} value={textEffectSize} onChange={(e) => setTextEffectSize(+e.target.value)} className="w-full accent-white" />
+                <span className="mt-1 block text-[8px] normal-case tracking-normal text-white/30">
+                  Толщина/радиус эффекта выбранной ниже кисти на буквах — независима от общего "Размер" в параметрах кисти слева
+                </span>
               </label>
               <div className="mb-1 text-[9px] uppercase tracking-widest text-white/40">Кисть для букв</div>
               <div className="grid grid-cols-2 gap-1">
