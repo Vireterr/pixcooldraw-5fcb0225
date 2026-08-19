@@ -4,6 +4,7 @@ import { GIFEncoder, quantize, applyPalette } from "gifenc";
 // PIXI v7 specifically (npm i pixi.js@^7) — v8 dropped/destabilized BaseTexture.fromBuffer, which is
 // the exact primitive the main canvas blit below relies on to push the CPU pixel buffer to the GPU.
 import * as PIXI from "pixi.js";
+import { getAnimatedGLRenderer, type AnimatedGLRenderer } from "./animated-gl-renderer";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -1162,6 +1163,35 @@ function IndexInner() {
   // BufferResource-backed texture that wraps pixelBufRef's `data` array directly (no per-frame copy),
   // and one full-canvas Sprite showing it. The APPLICATION (and its one WebGL context) is created
   // ONCE — see pixiAppRef and the effects below — only the texture is rebuilt when canvasSize changes.
+  // PERF (Static/Animated split): per-layer merged cache of every FROZEN stroke's baked pixels,
+  // composited together ONCE instead of being re-composited stroke-by-stroke every single frame.
+  // Keyed by layer.id. `strokesArrayRef` holds the exact `layer.strokes` array this entry was built
+  // against — erase/undo/redo/delete all replace that array wholesale (see eraseAt/undo/redo/
+  // deleteSelectedStrokes), so a reference mismatch is a cheap, reliable "this layer changed, rebuild"
+  // signal. `included` remembers which bakedCache OBJECT (not just which stroke id) went into the
+  // merged buffer, so a stroke that's moved/rotated/scaled — which mutates points in place and nulls
+  // bakedCache without touching the strokes array — is still detected (see getLayerStaticBuffer).
+  const layerStaticCacheRef = useRef<Map<number, {
+    w: number; h: number;
+    data: Uint8ClampedArray; alpha: Uint8ClampedArray; touched: Set<number>;
+    strokesArrayRef: Stroke[];
+    included: Map<number, NonNullable<Stroke["bakedCache"]> | undefined>;
+  }>>(new Map());
+  // === WebGL2 Animated Renderer ===
+  // A second <canvas>, stacked exactly on top of the main one (see JSX below), used ONLY to draw
+  // the "animated" pixel buffer — strokes that are still actively animating this frame. Everything
+  // else (background, static/frozen strokes, Selection overlay, Fill, Export) is completely
+  // untouched and keeps going through the existing main-canvas/Pixi path below.
+  const animGLCanvasRef = useRef<HTMLCanvasElement>(null);
+  // Tri-state: null = not yet attempted for the current canvas element/size, "unsupported" = WebGL2
+  // isn't available (permanent for this canvas — never retried), or an active renderer instance.
+  const animGLRendererRef = useRef<AnimatedGLRenderer | "unsupported" | null>(null);
+  // CPU-side scratch buffer the animated strokes are painted into (straight RGBA, alpha in the 4th
+  // byte) before a single texSubImage2D upload — reused every frame, reallocated only on resize,
+  // same reuse pattern as pixelBufRef below.
+  const animBufRef = useRef<{
+    data: Uint8ClampedArray; alphaBuf: Uint8ClampedArray; w: number; h: number; isoTarget: PaintTarget;
+  } | null>(null);
   const pixiAppRef = useRef<PIXI.Application | null>(null);
   const pixiRef = useRef<{
     app: PIXI.Application; baseTexture: PIXI.BaseTexture; sprite: PIXI.Sprite; w: number; h: number;
@@ -1591,7 +1621,40 @@ function IndexInner() {
       app.stage.addChild(sprite);
       pixiRef.current = { app, baseTexture, sprite, w, h };
     }
+    // Rebuild the animated-buffer CPU scratch space at the new size — same reuse-not-reallocate
+    // pattern as bufObj above, just for the WebGL2 overlay's own straight-RGBA source buffer.
+    const animData = new Uint8ClampedArray(w * h * 4);
+    const animAlpha = new Uint8ClampedArray(w * h);
+    animBufRef.current = {
+      data: animData, alphaBuf: animAlpha, w, h,
+      isoTarget: { mode: "iso", buf: animData, alphaBuf: animAlpha, bw: w, bh: h },
+    };
+
+    // (Re)create the WebGL2 renderer at the new size. Once a canvas has been found to lack WebGL2
+    // support it's marked "unsupported" and never retried — that can't change for the same canvas
+    // element without a page reload, so retrying every resize would just be wasted context-creation
+    // attempts (and some browsers log a warning each time).
+    const glCanvas = animGLCanvasRef.current;
+    const prevGL = animGLRendererRef.current;
+    if (prevGL && prevGL !== "unsupported") prevGL.destroy();
+    if (glCanvas && prevGL !== "unsupported") {
+      const renderer = getAnimatedGLRenderer(glCanvas);
+      animGLRendererRef.current = renderer ?? "unsupported";
+      if (renderer) renderer.resize(w, h);
+    } else if (!glCanvas) {
+      animGLRendererRef.current = null;
+    }
   }, [canvasSize]);
+
+  // Release WebGL2 resources (program/buffers/texture) on unmount — the canvasSize effect above
+  // already handles resize-time recreation; this only covers the component going away entirely.
+  useEffect(() => {
+    return () => {
+      const r = animGLRendererRef.current;
+      if (r && r !== "unsupported") r.destroy();
+      animGLRendererRef.current = null;
+    };
+  }, []);
 
   const eraseAt = useCallback((x: number, y: number, r: number) => {
     const r2 = r * r;
@@ -1653,34 +1716,116 @@ function IndexInner() {
       const liveOpts = bufObj.liveOpts;
       const bufferTarget = bufObj.bufferTarget;
 
-      for (const layer of layersRef.current) {
-        if (!layer.visible) continue;
-        if (layer.image) {
-          const imgPixels = ensureLayerImagePixels(layer, w, h);
-          if (imgPixels) blitLayerImage(buf, imgPixels);
+      // PERF cleanup: drop static-buffer cache entries for layers that no longer exist (deleted
+      // layers) — cheap, only touches the small map of layer ids, not any pixel data.
+      if (layerStaticCacheRef.current.size > 0) {
+        const liveIds = new Set(layersRef.current.map(l => l.id));
+        for (const id of layerStaticCacheRef.current.keys()) {
+          if (!liveIds.has(id)) layerStaticCacheRef.current.delete(id);
         }
-        for (const s of layer.strokes) {
-          if (s.points.length === 0) continue;
+      }
+
+      // WebGL2 Animated Renderer: only safe to pull ALL animated strokes out into the separate
+      // top-stacked overlay canvas when doing so can't change what's visually on top of what (see
+      // allLayersSafeForGLOverlay) — otherwise fall through to the exact original combined path
+      // below, unchanged, so correctness never depends on the GL path being available or taken.
+      const glR = animGLRendererRef.current;
+      const animBufObj = animBufRef.current;
+      const useGLOverlay = !!glR && glR !== "unsupported" && !!animBufObj
+        && animBufObj.w === w && animBufObj.h === h && allLayersSafeForGLOverlay(layersRef.current);
+
+      let anyAnimated = false;
+      if (useGLOverlay && animBufObj) {
+        animBufObj.data.fill(0);
+        animBufObj.alphaBuf.fill(0);
+        const animTarget = animBufObj.isoTarget;
+
+        for (const layer of layersRef.current) {
+          if (!layer.visible) continue;
+          if (layer.image) {
+            const imgPixels = ensureLayerImagePixels(layer, w, h);
+            if (imgPixels) blitLayerImage(buf, imgPixels);
+          }
+          // PERF (Static/Animated split, unchanged from the previous step): static strokes are
+          // blitted from one merged per-layer cache instead of recomposited stroke-by-stroke.
+          const staticEntry = getLayerStaticBuffer(layer, w, h, liveOpts);
+          if (staticEntry.touched.size > 0) compositeLayerStaticBuffer(buf, staticEntry);
+          for (const s of layer.strokes) {
+            if (s.points.length === 0) continue;
+            if (s.frozen && s !== currentStrokeRef.current) continue; // already in staticEntry
+            // Only the animated strokes go here — into the separate GPU-composited overlay buffer
+            // instead of the main CPU buffer, so the main buffer this frame is background+static
+            // only (no per-frame animated repaint work happens on it at all).
+            renderStroke(animTarget, s, w, h, t, dtRaw, now, liveOpts);
+            anyAnimated = true;
+          }
+        }
+
+        if (anyAnimated) {
+          // Pack the separate alpha channel into byte 4 of each pixel so the buffer is a plain,
+          // upload-ready RGBA texture source — same straight-alpha convention texSubImage2D expects.
+          const data = animBufObj.data, alpha = animBufObj.alphaBuf;
+          for (let i = 0, n = alpha.length; i < n; i++) data[i * 4 + 3] = alpha[i];
+          (glR as AnimatedGLRenderer).update(data, w, h);
+          (glR as AnimatedGLRenderer).draw();
+        } else {
+          // Nothing animated this frame (e.g. "Анимация" toggled off, or scene has only static
+          // strokes) — skip the texture upload entirely and just clear the overlay to transparent.
+          (glR as AnimatedGLRenderer).clear();
+        }
+      } else {
+        // Original combined path — animated strokes render straight into the main buffer, exactly
+        // as before this feature. Used whenever WebGL2 isn't available, or the current scene's
+        // z-order can't be safely split into "static, then animated on top" globally.
+        if (glR && glR !== "unsupported") glR.clear(); // avoid stale overlay content from a prior frame
+        for (const layer of layersRef.current) {
+          if (!layer.visible) continue;
+          if (layer.image) {
+            const imgPixels = ensureLayerImagePixels(layer, w, h);
+            if (imgPixels) blitLayerImage(buf, imgPixels);
+          }
           // Frozen strokes (born while "Анимация" was off) always render as if it's still the
           // instant they were created — same t/dt/now every frame — so their pattern is painted
           // once and stays put instead of flowing/wobbling/pulsing forever. Non-frozen strokes are
           // unaffected, whatever the toggle's CURRENT state is — only stroke creation reads it.
-          // Bake once the stroke is actually finished, not on every point added while it's still
-          // being drawn — see bakeFrozenStroke below for why re-baking mid-draw was expensive (full
-          // canvas-sized allocations + a full pixel scan), and why that cost used to grow with every
-          // single point, making a long frozen stroke get progressively laggier as you drew it.
-          if (s.frozen && s !== currentStrokeRef.current) {
-            if (!s.bakedCache || s.bakedCache.pointCount !== s.points.length) bakeFrozenStroke(s, w, h, s.born / 1000, 0, s.born, liveOpts);
-            compositeBakedStroke(buf, s.bakedCache!);
+          //
+          // PERF (Static/Animated split): when every static stroke precedes every animated one in
+          // z-order (the common case — finished art first, animated effects added on top), the whole
+          // set of static strokes is blitted from one merged cache in a single pass instead of being
+          // recomposited stroke-by-stroke, and only the truly animated strokes run renderStroke this
+          // frame. Adding a new animated stroke never touches the static strokes' cached pixels. When
+          // the order isn't safe to flatten (a static stroke sits ON TOP of an animated one), fall back
+          // to the original per-stroke path so z-order is never altered.
+          if (layerStrokeOrderSafeForStatic(layer)) {
+            const staticEntry = getLayerStaticBuffer(layer, w, h, liveOpts);
+            if (staticEntry.touched.size > 0) compositeLayerStaticBuffer(buf, staticEntry);
+            for (const s of layer.strokes) {
+              if (s.points.length === 0) continue;
+              if (s.frozen && s !== currentStrokeRef.current) continue; // already in staticEntry
+              renderStroke(bufferTarget, s, w, h, t, dtRaw, now, liveOpts);
+            }
           } else {
-            renderStroke(bufferTarget, s, w, h, t, dtRaw, now, liveOpts);
+            for (const s of layer.strokes) {
+              if (s.points.length === 0) continue;
+              // Bake once the stroke is actually finished, not on every point added while it's still
+              // being drawn — see bakeFrozenStroke below for why re-baking mid-draw was expensive (full
+              // canvas-sized allocations + a full pixel scan), and why that cost used to grow with every
+              // single point, making a long frozen stroke get progressively laggier as you drew it.
+              if (s.frozen && s !== currentStrokeRef.current) {
+                if (!s.bakedCache || s.bakedCache.pointCount !== s.points.length) bakeFrozenStroke(s, w, h, s.born / 1000, 0, s.born, liveOpts);
+                compositeBakedStroke(buf, s.bakedCache!);
+              } else {
+                renderStroke(bufferTarget, s, w, h, t, dtRaw, now, liveOpts);
+              }
+            }
           }
         }
       }
 
       // Final flush: push the CPU buffer to the GPU texture (baseTexture.update() re-uploads the
       // exact same `buf` array the loop above just painted into — no copy) and let Pixi composite it,
-      // instead of the CPU-bound ctx.putImageData call this replaced.
+      // instead of the CPU-bound ctx.putImageData call this replaced. The WebGL2 animated overlay (if
+      // used this frame) already drew itself onto its own stacked canvas above, independently.
       px.baseTexture.update();
       px.app.renderer.render(px.app.stage);
 
@@ -2513,6 +2658,116 @@ function IndexInner() {
     for (let k = 0; k < touched.length; k++) {
       const mi = touched[k], idx = mi * 4;
       blendIsoPixel(buf, alphaBuf, idx, mi, data[idx], data[idx + 1], data[idx + 2], alpha[mi] / 255);
+    }
+  }
+
+  // PERF (Static/Animated split): true when every FROZEN ("static") stroke on this layer comes
+  // BEFORE every non-frozen ("animated") stroke in z-order. Only in that case can the merged static
+  // buffer (one flat blit) stand in for compositing each static stroke individually every frame —
+  // if a static stroke were drawn on top of an earlier animated one, flattening them into one
+  // "static block, then animated on top" pass would silently reorder what's on top of what. Cheap
+  // early-exit scan, not a render — the actual per-frame cost this replaces is per-stroke compositing.
+  function layerStrokeOrderSafeForStatic(layer: Layer): boolean {
+    let sawAnimated = false;
+    for (const s of layer.strokes) {
+      if (s.points.length === 0) continue;
+      const isAnimated = !s.frozen || s === currentStrokeRef.current;
+      if (isAnimated) sawAnimated = true;
+      else if (sawAnimated) return false;
+    }
+    return true;
+  }
+
+  // WebGL2 Animated Renderer: whether it's safe THIS frame to draw every layer's animated strokes
+  // as one combined overlay stacked on top of the ENTIRE main canvas (background + every layer's
+  // static content). That's only visually identical to the original single-buffer compositing when
+  // no static content anywhere sits above any animated content in final z-order — i.e. every layer
+  // is individually order-safe (see layerStrokeOrderSafeForStatic), AND once we've passed the first
+  // layer (bottom→top) that contains any animated stroke, no later visible layer draws anything
+  // static (an image, or a non-empty non-animated stroke) that would otherwise need to occlude it.
+  // Cheap flag-only scan — falls back to the exact previous single-buffer path whenever this is
+  // false, so correctness never depends on the WebGL2 path being taken.
+  function allLayersSafeForGLOverlay(layers: Layer[]): boolean {
+    let sawAnimatedLayer = false;
+    for (const layer of layers) {
+      if (!layer.visible) continue;
+      if (!layerStrokeOrderSafeForStatic(layer)) return false;
+      const hasAnimated = layer.strokes.some(s => s.points.length > 0 && (!s.frozen || s === currentStrokeRef.current));
+      const hasStatic = !!layer.image || layer.strokes.some(s => s.points.length > 0 && s.frozen && s !== currentStrokeRef.current);
+      if (sawAnimatedLayer && hasStatic) return false;
+      if (hasAnimated) sawAnimatedLayer = true;
+    }
+    return true;
+  }
+
+  // PERF (Static/Animated split): returns (building/updating as needed) the merged cache of every
+  // finished, non-animating stroke on this layer, composited together once. Called every frame, but
+  // does real work only the first time a given static stroke appears, or when a previously-merged
+  // stroke's baked pixels actually changed (move/rotate/scale) — everything else is an O(1) map
+  // lookup per stroke. The result is a small handful of blits per frame instead of one per stroke.
+  function getLayerStaticBuffer(layer: Layer, w: number, h: number, opts: RenderOpts) {
+    const cacheMap = layerStaticCacheRef.current;
+    let entry = cacheMap.get(layer.id);
+    if (!entry || entry.w !== w || entry.h !== h || entry.strokesArrayRef !== layer.strokes) {
+      entry = {
+        w, h,
+        data: new Uint8ClampedArray(w * h * 4),
+        alpha: new Uint8ClampedArray(w * h),
+        touched: new Set<number>(),
+        strokesArrayRef: layer.strokes,
+        included: new Map(),
+      };
+      cacheMap.set(layer.id, entry);
+    }
+
+    // First pass: make sure every static stroke is baked, and detect whether any stroke we already
+    // merged in has since changed underneath us (same stroke id, different bakedCache object) — that
+    // can only happen via in-place point mutation (drag-move/rotate/scale), since anything that
+    // replaces the strokes array already forced a fresh `entry` above. A changed stroke's old pixels
+    // are already blended into `entry.data`/`entry.alpha` and can't be cheaply subtracted, so treat
+    // it as a full rebuild of just this layer's static buffer — still far cheaper than doing this
+    // every frame, since it only fires on the rare frame a static stroke's geometry actually changes.
+    let needsFullRebuild = false;
+    for (const s of layer.strokes) {
+      if (!s.frozen || s === currentStrokeRef.current || s.points.length === 0) continue;
+      if (!s.bakedCache || s.bakedCache.pointCount !== s.points.length) {
+        bakeFrozenStroke(s, w, h, s.born / 1000, 0, s.born, opts);
+      }
+      const prev = entry.included.get(s.id);
+      if (prev !== undefined && prev !== s.bakedCache) { needsFullRebuild = true; break; }
+    }
+
+    if (needsFullRebuild) {
+      entry.data.fill(0);
+      entry.alpha.fill(0);
+      entry.touched.clear();
+      entry.included.clear();
+    }
+
+    for (const s of layer.strokes) {
+      if (!s.frozen || s === currentStrokeRef.current || s.points.length === 0) continue;
+      if (entry.included.get(s.id) === s.bakedCache) continue; // already merged, unchanged
+      compositeBakedStrokeIso(entry.data, entry.alpha, s.bakedCache!);
+      const { touched } = s.bakedCache!;
+      for (let k = 0; k < touched.length; k++) entry.touched.add(touched[k]);
+      entry.included.set(s.id, s.bakedCache);
+    }
+
+    return entry;
+  }
+
+  // Blits a merged static-layer buffer onto the live (always-opaque) frame buffer — same "over
+  // real alpha onto opaque destination" math as compositeBakedStroke, just iterating the merged
+  // buffer's own touched-pixel set instead of one stroke's.
+  function compositeLayerStaticBuffer(buf: Uint8ClampedArray, entry: { data: Uint8ClampedArray; alpha: Uint8ClampedArray; touched: Set<number> }) {
+    const { data, alpha, touched } = entry;
+    for (const mi of touched) {
+      const idx = mi * 4;
+      const a = alpha[mi] / 255, ia = 1 - a;
+      buf[idx] = data[idx] * a + buf[idx] * ia;
+      buf[idx + 1] = data[idx + 1] * a + buf[idx + 1] * ia;
+      buf[idx + 2] = data[idx + 2] * a + buf[idx + 2] * ia;
+      buf[idx + 3] = 255;
     }
   }
 
@@ -3920,6 +4175,21 @@ function IndexInner() {
             ref={canvasRef}
             style={{ width: canvasSize.w * zoom, height: canvasSize.h * zoom, imageRendering: "pixelated" }}
             className="block rounded-lg border border-white/10 bg-[#080a12] shadow-2xl"
+          />
+          {/* WebGL2 Animated Renderer overlay: stacked exactly on top of the main canvas, same
+              size/position/scale, transparent background. Drawn to directly by the tick() loop
+              above (not through React) whenever the WebGL2 path is available and safe to use this
+              frame; otherwise the tick loop clears it and animated strokes render into the main
+              canvas exactly as before. pointer-events: none so every existing pointer handler
+              (drawing, selection, panning) keeps hitting the main canvas underneath, unchanged. */}
+          <canvas
+            ref={animGLCanvasRef}
+            style={{
+              position: "absolute", left: 0, top: 0,
+              width: canvasSize.w * zoom, height: canvasSize.h * zoom,
+              imageRendering: "pixelated", pointerEvents: "none",
+            }}
+            className="block rounded-lg"
           />
           {/* Selection overlay: live marquee while dragging a new box, or the bounding box of the
               current selection (draggable from inside via onDown's hit-test above) — same
