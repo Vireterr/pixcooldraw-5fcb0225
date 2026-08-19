@@ -102,6 +102,11 @@ interface Stroke {
   // count grows while actively drawing. Built lazily, extended as new points arrive, reset by
   // eraseAt() whenever points get removed/reindexed (see there for why).
   segCache?: { nx: number; ny: number; len: number; num: number }[];
+  // Transient gradient lookup caches. A stroke owns an immutable copy of its gradient stops, so
+  // the hue ramp is safe to build once and reuse for every animated frame. The fill RGB ramp is
+  // also reused as storage; only its values change with the gradient's moving phase.
+  gradientHueRamp?: Float32Array;
+  fillGradientRgbRamp?: Float32Array;
   // PERF (frozen strokes only): a one-time full-canvas-sized render of this stroke, built the first
   // time it's drawn while s.frozen is true. From then on tick() blits only this cache's touched
   // pixels instead of recomputing the stroke's animation math every frame — safe because a frozen
@@ -200,6 +205,9 @@ const MAX_POINTS_PER_STROKE = 600;
 // ==== PERF: tunables ====
 // Global cap on live pixelRain particles across the ENTIRE scene (was 200 PER STROKE before).
 const GLOBAL_RAIN_CAP = 2000;
+const BG_PACKED = (255 << 24) | (18 << 16) | (10 << 8) | 8;
+const GRAD_HUE_RAMP_SIZE = 256;
+const FILL_GRADIENT_RAMP_SIZE = 96;
 
 // FIX: the previous version multiplied n*n*15731 in ordinary floating-point arithmetic before
 // masking to 32 bits. That product exceeds 2^53 (float64's exact-integer limit) for almost any
@@ -1148,7 +1156,7 @@ function IndexInner() {
   // screen (see pixiRef below): a GPU-uploaded PIXI.Sprite instead of ctx.putImageData.
   const pixelBufRef = useRef<{
     data: Uint8ClampedArray; w: number; h: number;
-    buf32: Uint32Array; rainBudget: { left: number }; bufferTarget: PaintTarget;
+    buf32: Uint32Array; rainBudget: { left: number }; liveOpts: RenderOpts; bufferTarget: PaintTarget;
   } | null>(null);
   // Owns the WebGL side of the main canvas: one Application bound to canvasRef's <canvas>, one
   // BufferResource-backed texture that wraps pixelBufRef's `data` array directly (no per-frame copy),
@@ -1555,8 +1563,12 @@ function IndexInner() {
       data, w, h,
       buf32: new Uint32Array(data.buffer),
       rainBudget: { left: 0 },
+      liveOpts: { step: 1, rainBudget: { left: 0 } },
       bufferTarget: { mode: "buffer" as const, buf: data, buf32: new Uint32Array(data.buffer), bw: w, bh: h },
     };
+    // Keep both references pointed at the same mutable budget object. `liveOpts` is then reused
+    // by every animation frame instead of allocating a new options object in tick().
+    bufObj.liveOpts.rainBudget = bufObj.rainBudget;
     pixelBufRef.current = bufObj;
 
     // `data` (Uint8ClampedArray) and PIXI's BufferResource typings want Uint8Array — same underlying
@@ -1628,7 +1640,6 @@ function IndexInner() {
       const buf = bufObj.data;
       // Seed the opaque background fast via a 32-bit view instead of a per-byte loop — .fill() on a
       // typed array is a native, heavily optimized operation.
-      const BG_PACKED = (255 << 24) | (18 << 16) | (10 << 8) | 8; // little-endian bytes: R=8 G=10 B=18 A=255 (#080a12)
       bufObj.buf32.fill(BG_PACKED);
 
       const t = now / 1000;
@@ -1639,7 +1650,7 @@ function IndexInner() {
       // see rainCountRef/recomputeRainCount above for how it's kept accurate across spawn/despawn
       // AND the rare wholesale-removal paths (undo/redo/clear/delete-layer).
       bufObj.rainBudget.left = Math.max(0, GLOBAL_RAIN_CAP - rainCountRef.current);
-      const liveOpts: RenderOpts = { step: 1, rainBudget: bufObj.rainBudget };
+      const liveOpts = bufObj.liveOpts;
       const bufferTarget = bufObj.bufferTarget;
 
       for (const layer of layersRef.current) {
@@ -1740,27 +1751,31 @@ function IndexInner() {
     const legacySpread = rainbowFlowActive ? 360 : 0;
     const legacyFlow = rainbowFlowActive ? (mt * (10 + s.rainbowFlowSpeed * 150)) % 360 : 0;
     const nSeg = Math.max(1, pts.length - 1);
-    const gradAutoAngle = s.mode === "gradient" ? strokeAutoAngleDeg(pts) : 0;
-    const gradAngleRad = ((gradAutoAngle + s.gradientAngle) * Math.PI) / 180;
-    const gradCos = Math.cos(gradAngleRad), gradSin = Math.sin(gradAngleRad);
-    // Normalize the projection so the picked colors span roughly the visible canvas regardless of angle.
-    const gradExtent = Math.abs(w * gradCos) + Math.abs(h * gradSin) || 1;
-    const gradTravel = mt * (0.03 + s.gradientSpeed * 0.5);
-    // PERF: precompute the gradient's color cycle ONCE per stroke per frame instead of calling
-    // sampleGradient() (a loop over the stops) at every point/pixel that needs a gradient hue.
-    // Deliberately built WITHOUT gradTravel baked in — travel is a pure phase shift, so it's added
-    // at lookup time (see gradHueRampAt) by rotating which ramp index gets read, meaning this ramp
-    // stays valid (and doesn't need rebuilding) for the whole frame regardless of animation speed.
-    const GRAD_RAMP_N = 256;
-    let gradHueRamp: Float32Array | null = null;
-    const gradHueRampAt = (proj: number): number => {
-      if (s.mode !== "gradient") return sampleGradient(s.gradientColors, proj);
+    const isGradient = s.mode === "gradient";
+    let gradCos = 1, gradSin = 0, gradExtent = 1, gradTravel = 0;
+    let gradHueRamp: Float32Array | undefined;
+    if (isGradient) {
+      const gradAutoAngle = strokeAutoAngleDeg(pts);
+      const gradAngleRad = ((gradAutoAngle + s.gradientAngle) * Math.PI) / 180;
+      gradCos = Math.cos(gradAngleRad);
+      gradSin = Math.sin(gradAngleRad);
+      // Normalize the projection so the picked colors span roughly the visible canvas regardless of angle.
+      gradExtent = Math.abs(w * gradCos) + Math.abs(h * gradSin) || 1;
+      gradTravel = mt * (0.03 + s.gradientSpeed * 0.5);
+      // Gradient stops are copied into a stroke when it is created and never change afterwards.
+      // Keep the quantized palette on the stroke, rather than allocating a Float32Array for every
+      // animated frame. Travel remains a lookup-time phase shift, exactly as before.
+      gradHueRamp = s.gradientHueRamp;
       if (!gradHueRamp) {
-        gradHueRamp = new Float32Array(GRAD_RAMP_N);
-        for (let k = 0; k < GRAD_RAMP_N; k++) gradHueRamp[k] = sampleGradient(s.gradientColors, k / GRAD_RAMP_N);
+        gradHueRamp = new Float32Array(GRAD_HUE_RAMP_SIZE);
+        for (let k = 0; k < GRAD_HUE_RAMP_SIZE; k++) gradHueRamp[k] = sampleGradient(s.gradientColors, k / GRAD_HUE_RAMP_SIZE);
+        s.gradientHueRamp = gradHueRamp;
       }
+    }
+    const gradHueRampAt = (proj: number): number => {
+      if (!isGradient) return sampleGradient(s.gradientColors, proj);
       const norm = ((proj % 1) + 1) % 1;
-      return gradHueRamp[Math.min(GRAD_RAMP_N - 1, Math.floor(norm * GRAD_RAMP_N))];
+      return gradHueRamp![Math.min(GRAD_HUE_RAMP_SIZE - 1, Math.floor(norm * GRAD_HUE_RAMP_SIZE))];
     };
     const gradientHueAtXY = (x: number, y: number): number => {
       const proj = ((x * gradCos + y * gradSin) / gradExtent) * s.gradientScale;
@@ -1812,14 +1827,20 @@ function IndexInner() {
       // Fill всегда полностью непрозрачный — перекрывает всё под ним
       const alpha = 1.0;
 
-      if (s.mode === "gradient") {
-        const RAMP = 96;
-        const ramp: [number, number, number][] = new Array(RAMP);
+      if (isGradient) {
+        let ramp = s.fillGradientRgbRamp;
+        if (!ramp) {
+          ramp = new Float32Array(FILL_GRADIENT_RAMP_SIZE * 3);
+          s.fillGradientRgbRamp = ramp;
+        }
         const fillS = Math.max(0, Math.min(100, 85 * (target.satMul ?? 1)));
         const fillL = Math.max(0, Math.min(100, 55 + (target.lightShift ?? 0)));
-        for (let k = 0; k < RAMP; k++) {
-          const hueK = sampleGradient(s.gradientColors, k / RAMP + gradTravel);
-          ramp[k] = getHslRgb(hueK, fillS, fillL);
+        for (let k = 0, rgb = 0; k < FILL_GRADIENT_RAMP_SIZE; k++, rgb += 3) {
+          const hueK = sampleGradient(s.gradientColors, k / FILL_GRADIENT_RAMP_SIZE + gradTravel);
+          const color = getHslRgb(hueK, fillS, fillL);
+          ramp[rgb] = color[0];
+          ramp[rgb + 1] = color[1];
+          ramp[rgb + 2] = color[2];
         }
         if (target.mode === "buffer") {
           const buf = target.buf!;
@@ -1829,7 +1850,8 @@ function IndexInner() {
               if (!mask[mi]) continue;
               const proj = ((xx * gradCos + yy * gradSin) / gradExtent) * s.gradientScale + gradTravel;
               const norm = ((proj % 1) + 1) % 1;
-              const [r, g, b] = ramp[Math.min(RAMP - 1, Math.floor(norm * RAMP))];
+              const rgb = Math.min(FILL_GRADIENT_RAMP_SIZE - 1, Math.floor(norm * FILL_GRADIENT_RAMP_SIZE)) * 3;
+              const r = ramp[rgb], g = ramp[rgb + 1], b = ramp[rgb + 2];
               const idx = mi * 4;
               buf[idx] = r;
               buf[idx + 1] = g;
@@ -1845,7 +1867,8 @@ function IndexInner() {
               if (!mask[mi]) continue;
               const proj = ((xx * gradCos + yy * gradSin) / gradExtent) * s.gradientScale + gradTravel;
               const norm = ((proj % 1) + 1) % 1;
-              const [r, g, b] = ramp[Math.min(RAMP - 1, Math.floor(norm * RAMP))];
+              const rgb = Math.min(FILL_GRADIENT_RAMP_SIZE - 1, Math.floor(norm * FILL_GRADIENT_RAMP_SIZE)) * 3;
+              const r = ramp[rgb], g = ramp[rgb + 1], b = ramp[rgb + 2];
               blendIsoPixel(buf, alphaBuf, mi * 4, mi, r, g, b, alpha);
             }
           }
@@ -2251,11 +2274,10 @@ function IndexInner() {
                 paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
               }
             } else {
-              const offs = [-grid, 0, grid];
               for (let c2 = 0; c2 < 3; c2++) {
                 for (let xb = 0; xb < widthLine; xb += grid) {
                   if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-                  const off = xb + offs[c2];
+                  const off = xb + (c2 - 1) * grid;
                   const px = startX + tx * off, py = startY + ty * off;
                   paint(target, Math.round(px / grid) * grid, Math.round(py / grid) * grid, grid, grid, hueG, 100, 55, alphaMul * 0.55);
                 }
@@ -2300,26 +2322,20 @@ function IndexInner() {
             const widthLine = radius * 2 * (0.6 + Math.random() * 0.4);
             const x0 = px - widthLine / 2 + shift;
             const y0 = Math.round((py + yOff) / grid) * grid;
-            const offs = [-grid, 0, grid];
-            let hues: number[];
-            if (s.mode === "gradient") {
-              // Sample the actual chosen palette at three nearby positions instead of a synthetic
-              // +120/+240 hue offset — otherwise the channel-split always looks like a generic RGB
-              // trio no matter which colors were picked, making the tool feel unresponsive to them.
-              const spread = 0.035;
-              const basePos = (px * gradCos + py * gradSin) / gradExtent + gradTravel;
-              hues = [
-                sampleGradient(s.gradientColors, basePos - spread),
-                sampleGradient(s.gradientColors, basePos),
-                sampleGradient(s.gradientColors, basePos + spread),
-              ];
-            } else {
-              hues = [hueG % 360, (hueG + 120) % 360, (hueG + 240) % 360];
-            }
             for (let c2 = 0; c2 < 3; c2++) {
+              let hueC: number;
+              if (isGradient) {
+                // Sample the actual chosen palette at three nearby positions instead of a synthetic
+                // +120/+240 hue offset — otherwise the channel-split always looks like a generic RGB
+                // trio no matter which colors were picked, making the tool feel unresponsive to them.
+                const basePos = (px * gradCos + py * gradSin) / gradExtent + gradTravel;
+                hueC = sampleGradient(s.gradientColors, basePos + (c2 - 1) * 0.035);
+              } else {
+                hueC = (hueG + c2 * 120) % 360;
+              }
               for (let xb = 0; xb < widthLine; xb += grid) {
                 if (Math.random() > 0.4 + s.intensity * 0.5) continue;
-                paint(target, Math.round((x0 + xb + offs[c2]) / grid) * grid, y0, grid, grid, hues[c2], 100, 55, alphaMul * 0.55);
+                paint(target, Math.round((x0 + xb + (c2 - 1) * grid) / grid) * grid, y0, grid, grid, hueC, 100, 55, alphaMul * 0.55);
               }
             }
           }
